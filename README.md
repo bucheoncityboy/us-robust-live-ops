@@ -31,6 +31,12 @@
 
 수치는 과거 데이터 기반이고, 특히 유니버스가 현재 시장 구성종목 기준이라 생존 편향이 일부 있습니다. 미래 성과를 보장하지 않습니다.
 
+## 아키텍처
+
+![US-Robust Live Ops architecture](docs/architecture.png)
+
+Python(ops/)이 신호·비중·NAV 계산의 유일한 원천이고, 엑셀 원장과 Notion은 결과를 그려주는 소비자다. 자세한 설명은 [docs/architecture.md](docs/architecture.md)를 참고.
+
 ## 저장소 구조
 
 ```text
