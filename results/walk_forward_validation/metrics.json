@@ -1,0 +1,182 @@
+{
+  "protocol": {
+    "train": "expanding from 2019-08-01",
+    "test": "five consecutive six-month windows from 2024-01",
+    "selection": "training daily excess-return IR; ties by name",
+    "round_trip_cost_bps": 10,
+    "execution": "next open; liquidate at each fold end",
+    "candidates": [
+      "Robust_L70_LV30",
+      "Robust_L60_M63_LV20",
+      "Robust_L50_RM_LV20",
+      "Robust_L55_NH_LV25"
+    ]
+  },
+  "limitations": [
+    "Retrospective protocol; candidate definitions were developed with historical data knowledge.",
+    "Cached current-constituent universe retains survivorship bias.",
+    "Not prospective live performance; original published figures are not replaced."
+  ],
+  "folds": [
+    {
+      "fold": 1,
+      "train_start": "2019-08-01",
+      "train_end": "2023-12-29",
+      "test_start": "2024-01-02",
+      "test_end": "2024-06-28",
+      "selected": "Robust_L60_M63_LV20",
+      "training_scores": {
+        "Robust_L70_LV30": 0.6907141613140324,
+        "Robust_L60_M63_LV20": 0.9206158628377504,
+        "Robust_L50_RM_LV20": 0.8591727861143454,
+        "Robust_L55_NH_LV25": 0.6734201129059215
+      },
+      "strategy": {
+        "n_days": 124,
+        "total_return": 0.37174679828265633,
+        "cagr": 0.9009736740914431,
+        "sharpe": 2.3501268449095916,
+        "mdd": -0.09789323490849688
+      },
+      "benchmark": {
+        "n_days": 124,
+        "total_return": 0.15224168863132959,
+        "cagr": 0.33374389708890173,
+        "sharpe": 2.746476914974695,
+        "mdd": -0.05353882977337032
+      }
+    },
+    {
+      "fold": 2,
+      "train_start": "2019-08-01",
+      "train_end": "2024-06-28",
+      "test_start": "2024-07-01",
+      "test_end": "2024-12-31",
+      "selected": "Robust_L50_RM_LV20",
+      "training_scores": {
+        "Robust_L70_LV30": 0.7602915233376945,
+        "Robust_L60_M63_LV20": 1.0076920753797032,
+        "Robust_L50_RM_LV20": 1.0172744532610474,
+        "Robust_L55_NH_LV25": 0.7515492122277118
+      },
+      "strategy": {
+        "n_days": 128,
+        "total_return": 0.27004843937714207,
+        "cagr": 0.601017895957324,
+        "sharpe": 1.856120983891359,
+        "mdd": -0.14991632038264613
+      },
+      "benchmark": {
+        "n_days": 128,
+        "total_return": 0.08385641569110125,
+        "cagr": 0.17179229517470684,
+        "sharpe": 1.1889586048082759,
+        "mdd": -0.08405617321056413
+      }
+    },
+    {
+      "fold": 3,
+      "train_start": "2019-08-01",
+      "train_end": "2024-12-31",
+      "test_start": "2025-01-02",
+      "test_end": "2025-06-30",
+      "selected": "Robust_L60_M63_LV20",
+      "training_scores": {
+        "Robust_L70_LV30": 0.8904844312847054,
+        "Robust_L60_M63_LV20": 1.1472528751747022,
+        "Robust_L50_RM_LV20": 1.1230970416373562,
+        "Robust_L55_NH_LV25": 0.8599282654927293
+      },
+      "strategy": {
+        "n_days": 122,
+        "total_return": 0.13113009606409798,
+        "cagr": 0.28983493592937326,
+        "sharpe": 1.1472614915038208,
+        "mdd": -0.22018315847496805
+      },
+      "benchmark": {
+        "n_days": 122,
+        "total_return": 0.06050486093398422,
+        "cagr": 0.129011299551546,
+        "sharpe": 0.5984459131914697,
+        "mdd": -0.18755229084676694
+      }
+    },
+    {
+      "fold": 4,
+      "train_start": "2019-08-01",
+      "train_end": "2025-06-30",
+      "test_start": "2025-07-01",
+      "test_end": "2025-12-31",
+      "selected": "Robust_L50_RM_LV20",
+      "training_scores": {
+        "Robust_L70_LV30": 0.8823683296732713,
+        "Robust_L60_M63_LV20": 1.0911272980917843,
+        "Robust_L50_RM_LV20": 1.165269975375957,
+        "Robust_L55_NH_LV25": 0.8512407484202326
+      },
+      "strategy": {
+        "n_days": 128,
+        "total_return": 0.27895193419471376,
+        "cagr": 0.6231896006792927,
+        "sharpe": 1.8482198762177249,
+        "mdd": -0.1189726249602967
+      },
+      "benchmark": {
+        "n_days": 128,
+        "total_return": 0.11002851672954872,
+        "cagr": 0.22815047415974843,
+        "sharpe": 1.955041839186366,
+        "mdd": -0.050713557388441854
+      }
+    },
+    {
+      "fold": 5,
+      "train_start": "2019-08-01",
+      "train_end": "2025-12-31",
+      "test_start": "2026-01-02",
+      "test_end": "2026-06-30",
+      "selected": "Robust_L50_RM_LV20",
+      "training_scores": {
+        "Robust_L70_LV30": 0.9243435402061849,
+        "Robust_L60_M63_LV20": 1.1883359738209998,
+        "Robust_L50_RM_LV20": 1.1925527707946793,
+        "Robust_L55_NH_LV25": 0.8962398352665194
+      },
+      "strategy": {
+        "n_days": 123,
+        "total_return": 1.1614688101783726,
+        "cagr": 3.8509540891985,
+        "sharpe": 3.499627276388473,
+        "mdd": -0.13536822178183194
+      },
+      "benchmark": {
+        "n_days": 123,
+        "total_return": 0.10091883556070913,
+        "cagr": 0.2177200258320109,
+        "sharpe": 1.457263992407915,
+        "mdd": -0.08884964925337846
+      }
+    }
+  ],
+  "stitched_strategy": {
+    "n_days": 625,
+    "total_return": 4.44765999803359,
+    "cagr": 0.9807965445463369,
+    "sharpe": 2.24987033830221,
+    "mdd": -0.22018315847496794
+  },
+  "stitched_benchmark": {
+    "n_days": 625,
+    "total_return": 0.6185176449884942,
+    "cagr": 0.21427247663085747,
+    "sharpe": 1.2964446290547416,
+    "mdd": -0.18755229084676694
+  },
+  "input_sha256": {
+    "us_prices_panel": "9a2e883d2d7ccdc16b90b6b0b6bcad788e3a8af36353999a8353052399aef98e",
+    "us_open_panel": "7b33f0d5c7644646bbf6920e5ca209d4346106fd4bee52dcdb61bcff96ea4592",
+    "us_volume_panel": "ad3f633ea27dea40001265940e233eb6d8dce53fdc0ac5c34e79d80b5b0e30f5",
+    "spy": "f7c6a5e12f58a89610e284d9dc793807527104c4ddee3f2b9a696ef5bd0fbd06"
+  }
+}
