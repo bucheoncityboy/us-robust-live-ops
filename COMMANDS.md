@@ -14,6 +14,28 @@ python ops.py execute --risk-mode NORMAL
 python ops.py weekly
 ```
 
+## Offline fixed-strategy validation
+
+```bash
+# Local cached panels only; this research entrypoint does not import the broker.
+python research/walk_forward_validation.py --mode fixed --data-dir data/us
+# An existing 0719 cache can be used directly on Windows:
+python research/walk_forward_validation.py --mode fixed --data-dir "C:/Users/PC/Desktop/AI/0719/data/us"
+npm ci
+npm run check
+npx tsx src/harness.ts
+python -m pytest tests/ -q
+
+# Preserve/reproduce the previous candidate-selection experiment separately:
+python research/walk_forward_validation.py --mode candidate --data-dir data/us
+```
+
+Fixed mode writes `results/fixed_strategy_validation/`: five IS/OOS fold metrics,
+OOS daily/monthly returns, prior-close regime diagnostics, paired monthly excess
+t-test, 10,000 IID draws and 10,000 circular four-month block draws, plus a
+signal/target audit. The 60/20/20 policy is fixed; IS is diagnostic, with no refit.
+Candidate mode writes `results/walk_forward_validation/`.
+
 ## Monthly standard procedure
 
 ```bash

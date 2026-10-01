@@ -17,7 +17,33 @@
 - 패키지 매니페스트(SHA256)로 신호·목표 위변조를 실행 전에 감지
 - 실주문은 `ops.py execute` + 명시적 위험모드(NORMAL/L1/L2)에서만 통과
 
-## 확장형 Walk-Forward 검증
+## 고정 60/20/20 전략의 IS/OOS 검증
+
+운용 대상인 `Robust_L60_M63_LV20`을 IS와 OOS로 구분하고 시간순 5개 Fold로 평가했습니다. IS는 2019년 8월부터 확장하며 OOS는 2024년 1월부터 2026년 6월까지 6개월씩 구성했습니다. 고정 전략이므로 모든 Fold에서 같은 종목 선정 규칙과 60/20/20 비중을 사용합니다. IS는 진단용이며 파라미터를 재학습하지 않습니다.
+
+월말 종가로 신호를 확정하고 익영업일 시가에 체결했습니다. 기존 보유분을 시가로 평가한 자산가치를 주문 예산으로 사용하고 매수와 매도 금액에 각각 5bp를 부과해 왕복 10bp 비용을 반영했습니다. 각 Fold는 현금에서 시작하며 종료 시 청산 비용도 반영합니다.
+
+같은 OOS 수익률로 시장 국면별 성과를 구분하고 SPY 대비 월별 초과수익에 t검정을 적용했습니다. IID Bootstrap과 4개월 순환 Block Bootstrap을 각각 10,000회 수행해 표본 민감도를 확인했습니다.
+
+- 연결 OOS: CAGR 99.91%, Sharpe 2.31, MDD -22.14%; 5개 Fold 모두 SPY 대비 초과수익
+- 월별 초과수익: 30개월 평균 4.50%, t=3.8571, 양측 p=0.000589
+- 월평균 초과수익의 95% Bootstrap 구간: IID 2.34%~6.73%, Block4 1.93%~7.16%
+- 국면별 일평균 초과수익: 상승·고변동 +0.335%, 상승·저변동 +0.161%, 하락·고변동 -0.075%; 하락·저변동은 표본 없음
+
+[검증 결과와 구간별 표](results/fixed_strategy_validation/README.md) | [상세 수치](results/fixed_strategy_validation/metrics.json) | [국면별 결과](results/fixed_strategy_validation/regime_table.csv) | [신호·목표비중 기록](results/fixed_strategy_validation/target_audit.json) | [검증 코드](research/walk_forward_validation.py)
+
+이 실행은 현재 전략을 대상으로 새로 수행한 사후 검증입니다. 입력 캐시는 현재 구성종목 기반 149개 종목이므로 과거 전체 S&P500 구성종목을 복원한 데이터가 아니며 생존편향과 사전 유니버스 선택 편향이 남습니다. 신호 시점의 20거래일 평균 거래대금 순위도 이 캐시 안에서 계산했습니다. 역사적 섹터 매핑에 따른 상한이나 실제 운용의 수동 위험모드 조정은 이 검증에 적용하지 않았습니다. 높은 수익률과 유의성은 이 데이터와 실험 조건에서의 결과입니다.
+
+```bash
+# 0719에서 사용한 가격 캐시를 지정해 재현할 수 있습니다.
+python research/walk_forward_validation.py --mode fixed --data-dir data/us
+npm ci
+npm run check
+npx tsx src/harness.ts
+python -m pytest tests/ -q
+```
+
+## 이전 후보 선택 Walk-Forward 검증
 
 기존 후보 전략 4개를 대상으로 과거 학습 구간의 정보비율만으로 전략을 선택하고, 다음 6개월을 평가하는 절차를 5회 반복했습니다. 학습은 2019년 8월부터 확장하며 평가 기간은 2024년 1월부터 2026년 6월까지입니다. 각 평가 구간의 결과는 그 구간의 전략 선택에 사용하지 않습니다.
 
@@ -28,11 +54,11 @@
 
 [검증 결과와 구간별 표](results/walk_forward_validation/README.md) | [상세 수치](results/walk_forward_validation/metrics.json) | [검증 코드](research/walk_forward_validation.py)
 
-이 실험은 이미 연구한 후보 정의와 현재 구성종목 기반 캐시를 사용한 사후 재검증입니다. 시간순 선택 절차를 적용했지만 후보 설계의 사후 선택 가능성과 생존편향은 남아 있으며, 실시간 운용 성과를 뜻하지 않습니다. 기존 IID/Block Bootstrap 및 파라미터 민감도 분석은 별도 고정 전략 연구입니다.
+이 실험은 이미 연구한 후보 정의와 현재 구성종목 기반 캐시를 사용한 사후 재검증입니다. 시간순 선택 절차를 적용했지만 후보 설계의 사후 선택 가능성과 생존편향은 남아 있으며, 실시간 운용 성과를 뜻하지 않습니다. 위의 고정 전략 검증과 다른 실험이며 결과 파일을 별도로 유지합니다.
 
 ```bash
 # 기존 로컬 가격 캐시 4개가 필요하며 네트워크와 주문 기능을 호출하지 않습니다.
-python research/walk_forward_validation.py
+python research/walk_forward_validation.py --mode candidate
 python -m unittest discover -s tests -p test_walk_forward_validation.py -v
 ```
 

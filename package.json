@@ -1,0 +1,7 @@
+{
+  "name": "us-robust-validation",
+  "private": true,
+  "type": "module",
+  "scripts": { "check": "tsc --noEmit", "test": "tsx src/harness.ts" },
+  "devDependencies": { "@types/node": "^22.0.0", "tsx": "^4.0.0", "typescript": "^5.0.0" }
+}

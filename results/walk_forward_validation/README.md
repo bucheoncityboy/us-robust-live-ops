@@ -16,7 +16,7 @@
 
 월말 신호를 익영업일 시가에 체결합니다. 리밸런싱 당일 보유자산은 시가로 평가하고 실제 매매금액에 편도 5bp, 왕복 10bp를 적용합니다. 각 구간은 현금에서 시작해 마지막 종가에 청산하며 두 거래의 비용을 모두 반영합니다. 구간별 수익률을 연결한 결과이며 고정 60/20/20 전략과 다릅니다.
 
-`python research/walk_forward_validation.py`로 실행합니다. `data/us/`의 `us_prices_panel.parquet`, `us_open_panel.parquet`, `us_volume_panel.parquet`, `spy.parquet`가 필요합니다. 가격 캐시는 저장소에 포함되지 않으므로 새 다운로드는 동일 결과를 보장하지 않습니다. 원본 캐시 SHA256은 [metrics.json](metrics.json)에 기록했습니다. 일별 평가 결과는 [oos_returns.csv](oos_returns.csv)에 있습니다.
+`python research/walk_forward_validation.py --mode candidate`로 실행합니다. `data/us/`의 `us_prices_panel.parquet`, `us_open_panel.parquet`, `us_volume_panel.parquet`, `spy.parquet`가 필요합니다. 가격 캐시는 저장소에 포함되지 않으므로 새 다운로드는 동일 결과를 보장하지 않습니다. 원본 캐시 SHA256은 [metrics.json](metrics.json)에 기록했습니다. 일별 평가 결과는 [oos_returns.csv](oos_returns.csv)에 있습니다.
 
 ## 해석 범위
 

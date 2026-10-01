@@ -35,3 +35,4 @@ results/qa_evidence/
 
 # Agent runtime
 .gjc/
+node_modules/

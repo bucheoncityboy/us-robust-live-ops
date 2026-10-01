@@ -1,0 +1,251 @@
+{
+  "protocol": {
+    "policy": "Robust_L60_M63_LV20",
+    "sleeve_weights": {
+      "leader": 0.6,
+      "mom63": 0.2,
+      "lowvol": 0.2
+    },
+    "train": "expanding IS from 2019-08-01; diagnostic only; no parameter fitting",
+    "test": "five consecutive six-month OOS windows from 2024-01-01 through 2026-06-30",
+    "tuning": "none; 60/20/20 weights and selectors fixed for every fold",
+    "execution": "month-end close signal; next observed trading-day open; cash start and close liquidation per fold",
+    "round_trip_cost_bps": 10,
+    "one_way_cost_bps": 5,
+    "name_cap": 0.15,
+    "universe": "trailing 20-session mean dollar volume top 150 among cached names with 252 valid sessions",
+    "cached_names": 149,
+    "regime": "previous-close SMA200 trend x RV21 above/below trailing 252-day median",
+    "inference": "paired monthly strategy minus SPY returns on stitched OOS only; two-sided t-test",
+    "sector": "no historical sector mapping/cap in this validation; production sector handling is best effort"
+  },
+  "limitations": [
+    "Retrospective validation; frozen strategy was designed with historical data knowledge.",
+    "Current-constituent cache retains survivorship/preselection bias; only 149 cached names, not historical full S&P500 membership.",
+    "Fixed-policy temporal validation; IS is diagnostic and is not a model-refitting walk-forward.",
+    "Monthly t-test assumes independent observations; block bootstrap only checks short dependence and sampling sensitivity.",
+    "SPY close-to-close returns are a passive gross benchmark; strategy pays entry/rebalance/exit costs.",
+    "No spread/slippage/impact model beyond 10bp round-trip cost; not live performance."
+  ],
+  "folds": [
+    {
+      "fold": 1,
+      "train_start": "2019-08-01",
+      "train_end": "2023-12-29",
+      "test_start": "2024-01-02",
+      "test_end": "2024-06-28",
+      "policy": "Robust_L60_M63_LV20",
+      "is_strategy": {
+        "n_days": 1112,
+        "total_return": 2.0306269437951747,
+        "cagr": 0.2856544786569648,
+        "sharpe": 1.1040803797510788,
+        "mdd": -0.34373818407607903
+      },
+      "oos_strategy": {
+        "n_days": 124,
+        "total_return": 0.36922791245175235,
+        "cagr": 0.8938864249878491,
+        "sharpe": 2.3379680228366513,
+        "mdd": -0.09827183937258854
+      },
+      "oos_benchmark": {
+        "n_days": 124,
+        "total_return": 0.15224168863132959,
+        "cagr": 0.33374389708890173,
+        "sharpe": 2.746476914974695,
+        "mdd": -0.05353882977337032
+      }
+    },
+    {
+      "fold": 2,
+      "train_start": "2019-08-01",
+      "train_end": "2024-06-28",
+      "test_start": "2024-07-01",
+      "test_end": "2024-12-31",
+      "policy": "Robust_L60_M63_LV20",
+      "is_strategy": {
+        "n_days": 1236,
+        "total_return": 3.1111968436197524,
+        "cagr": 0.334068092413373,
+        "sharpe": 1.2331174322801663,
+        "mdd": -0.34373818407607903
+      },
+      "oos_strategy": {
+        "n_days": 128,
+        "total_return": 0.30699314648233744,
+        "cagr": 0.6939987268030294,
+        "sharpe": 2.1606023539109835,
+        "mdd": -0.12921230288836993
+      },
+      "oos_benchmark": {
+        "n_days": 128,
+        "total_return": 0.08385641569110125,
+        "cagr": 0.17179229517470684,
+        "sharpe": 1.1889586048082759,
+        "mdd": -0.08405617321056413
+      }
+    },
+    {
+      "fold": 3,
+      "train_start": "2019-08-01",
+      "train_end": "2024-12-31",
+      "test_start": "2025-01-02",
+      "test_end": "2025-06-30",
+      "policy": "Robust_L60_M63_LV20",
+      "is_strategy": {
+        "n_days": 1364,
+        "total_return": 4.430770785976334,
+        "cagr": 0.3669927017415606,
+        "sharpe": 1.3272978900701589,
+        "mdd": -0.34373818407607903
+      },
+      "oos_strategy": {
+        "n_days": 122,
+        "total_return": 0.12970690687008601,
+        "cagr": 0.28648502156201383,
+        "sharpe": 1.136134147893831,
+        "mdd": -0.2214015747167194
+      },
+      "oos_benchmark": {
+        "n_days": 122,
+        "total_return": 0.06050486093398422,
+        "cagr": 0.129011299551546,
+        "sharpe": 0.5984459131914697,
+        "mdd": -0.18755229084676694
+      }
+    },
+    {
+      "fold": 4,
+      "train_start": "2019-08-01",
+      "train_end": "2025-06-30",
+      "test_start": "2025-07-01",
+      "test_end": "2025-12-31",
+      "policy": "Robust_L60_M63_LV20",
+      "is_strategy": {
+        "n_days": 1486,
+        "total_return": 5.192129940521648,
+        "cagr": 0.3623303533632858,
+        "sharpe": 1.3186160371945994,
+        "mdd": -0.34373818407607903
+      },
+      "oos_strategy": {
+        "n_days": 128,
+        "total_return": 0.34461471515165365,
+        "cagr": 0.7913359278959473,
+        "sharpe": 2.15143373731402,
+        "mdd": -0.1225098006613482
+      },
+      "oos_benchmark": {
+        "n_days": 128,
+        "total_return": 0.11002851672954872,
+        "cagr": 0.22815047415974843,
+        "sharpe": 1.955041839186366,
+        "mdd": -0.050713557388441854
+      }
+    },
+    {
+      "fold": 5,
+      "train_start": "2019-08-01",
+      "train_end": "2025-12-31",
+      "test_start": "2026-01-02",
+      "test_end": "2026-06-30",
+      "policy": "Robust_L60_M63_LV20",
+      "is_strategy": {
+        "n_days": 1614,
+        "total_return": 7.333887664602569,
+        "cagr": 0.3924367223485523,
+        "sharpe": 1.3918333058929222,
+        "mdd": -0.34373818407607903
+      },
+      "oos_strategy": {
+        "n_days": 123,
+        "total_return": 1.0502024018359224,
+        "cagr": 3.3531443933687637,
+        "sharpe": 3.343734589805351,
+        "mdd": -0.14313698379741402
+      },
+      "oos_benchmark": {
+        "n_days": 123,
+        "total_return": 0.10091883556070913,
+        "cagr": 0.2177200258320109,
+        "sharpe": 1.457263992407915,
+        "mdd": -0.08884964925337846
+      }
+    }
+  ],
+  "stitched_strategy": {
+    "n_days": 625,
+    "total_return": 4.573261692780017,
+    "cagr": 0.9990852948812572,
+    "sharpe": 2.306829245125254,
+    "mdd": -0.22140157471671962
+  },
+  "stitched_benchmark": {
+    "n_days": 625,
+    "total_return": 0.6185176449884942,
+    "cagr": 0.21427247663085747,
+    "sharpe": 1.2964446290547416,
+    "mdd": -0.18755229084676694
+  },
+  "statistics": {
+    "n_months": 30,
+    "mean_monthly_excess": 0.045045629979530606,
+    "t_stat": 3.857076437657442,
+    "p_value_two_sided": 0.0005889267099964776,
+    "significant_at_5pct": true,
+    "seed": 7,
+    "iid": {
+      "repetitions": 10000,
+      "mean_monthly_excess": 0.04502892906470857,
+      "ci95_monthly_excess": [
+        0.023449373455063552,
+        0.0673081597601586
+      ],
+      "fraction_mean_above_zero": 1.0
+    },
+    "block4": {
+      "block_months": 4,
+      "method": "circular moving blocks",
+      "repetitions": 10000,
+      "mean_monthly_excess": 0.04500775383027073,
+      "ci95_monthly_excess": [
+        0.01933838858422438,
+        0.0716048772793355
+      ],
+      "fraction_mean_above_zero": 1.0
+    }
+  },
+  "regimes": [
+    {
+      "regime": "down_high_vol",
+      "n_days": 54,
+      "mean_daily_strategy": 0.0012309374770660348,
+      "mean_daily_benchmark": 0.0019787795660367057,
+      "mean_daily_excess": -0.000747842088970671,
+      "contribution_to_oos_daily_excess_sum": -0.04038347280441623
+    },
+    {
+      "regime": "up_high_vol",
+      "n_days": 262,
+      "mean_daily_strategy": 0.004409324657229482,
+      "mean_daily_benchmark": 0.001056346383561344,
+      "mean_daily_excess": 0.0033529782736681376,
+      "contribution_to_oos_daily_excess_sum": 0.878480307701052
+    },
+    {
+      "regime": "up_low_vol",
+      "n_days": 309,
+      "mean_daily_strategy": 0.0020337527891502215,
+      "mean_daily_benchmark": 0.0004187824859054888,
+      "mean_daily_excess": 0.0016149703032447326,
+      "contribution_to_oos_daily_excess_sum": 0.4990258237026224
+    }
+  ],
+  "input_sha256": {
+    "us_prices_panel": "9a2e883d2d7ccdc16b90b6b0b6bcad788e3a8af36353999a8353052399aef98e",
+    "us_open_panel": "7b33f0d5c7644646bbf6920e5ca209d4346106fd4bee52dcdb61bcff96ea4592",
+    "us_volume_panel": "ad3f633ea27dea40001265940e233eb6d8dce53fdc0ac5c34e79d80b5b0e30f5",
+    "spy": "f7c6a5e12f58a89610e284d9dc793807527104c4ddee3f2b9a696ef5bd0fbd06"
+  }
+}
