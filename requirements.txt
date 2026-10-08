@@ -1,9 +1,17 @@
-# US-Robust Live Ops — Python dependencies
+# US-Robust Live Ops - Python dependencies
+# Python 3.11; the tested complete dependency graph is pinned below.
+-c requirements-lock.txt
 
 pandas>=2.0
 numpy>=1.24
 openpyxl>=3.1
 requests>=2.28
+tzdata>=2025.2
+exchange-calendars==4.13.2
+
+# refresh download clients (offline WFA does not require importing these)
+yfinance==1.7.0
+finance-datareader==0.9.202
 
 # research/ (strict backtest validation + PDF generators) only
 scipy>=1.10

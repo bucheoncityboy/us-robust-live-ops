@@ -33,7 +33,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -66,7 +65,7 @@ def _banner(step: str, title: str) -> None:
     print("=" * 60)
 
 
-def resolve_ops_month(asof: Optional[str] = None) -> Tuple[Path, pd.Timestamp]:
+def resolve_signal_month(asof: Optional[str] = None) -> Tuple[Path, pd.Timestamp]:
     """Return (run_dir, signal_date) for the active ops month (latest month-end ≤ asof/prices).
 
     Calendar source: US prices panel (us_hybrid_backtest.CACHE_PRICES /
@@ -75,12 +74,13 @@ def resolve_ops_month(asof: Optional[str] = None) -> Tuple[Path, pd.Timestamp]:
     import ops.us_hybrid_backtest as us
     from ops.ops_monthly_run import pick_signal_date
 
-    prices_path = us.CACHE_PRICES
+    prices_path = us.market_cache_path(us.CACHE_PRICES)
     if not prices_path.exists():
         # fall back to calendar month folder
-        now = datetime.now()
+        from ops.ops_live_safety import ny_today
+        now = ny_today()
         yyyymm = f"{now.year:04d}-{now.month:02d}"
-        return OPS_RUNS / yyyymm, pd.Timestamp(now.date())
+        return OPS_RUNS / yyyymm, pd.Timestamp(now)
 
     panel = pd.read_parquet(prices_path)
     if isinstance(panel.index, pd.MultiIndex):
@@ -91,6 +91,34 @@ def resolve_ops_month(asof: Optional[str] = None) -> Tuple[Path, pd.Timestamp]:
     signal_date = pick_signal_date(close, asof)
     yyyymm = f"{signal_date.year:04d}-{signal_date.month:02d}"
     return OPS_RUNS / yyyymm, signal_date
+
+
+def resolve_ops_month(asof: Optional[str] = None) -> Tuple[Path, pd.Timestamp]:
+    """Find the latest complete existing package, independently of the price tail."""
+    from ops.ops_live_safety import ny_today, nyse_calendar, verify_package_manifest
+    today = pd.Timestamp(ny_today())
+    cutoff = pd.Timestamp(asof) if asof else today
+    packages = []
+    for run_dir in OPS_RUNS.glob("????-??"):
+        if not all((run_dir / name).exists() for name in
+                   ("health.json", "signals.csv", "target.csv", "orders_preview.csv")):
+            continue
+        try:
+            health = json.loads((run_dir / "health.json").read_text(encoding="utf-8"))
+            signal = pd.Timestamp(health["signal_date"])
+            period = signal.to_period("M")
+            expected = nyse_calendar(period.start_time, period.end_time).sessions_in_range(
+                period.start_time.normalize(), period.end_time.normalize())[-1]
+            if (signal == expected and signal <= cutoff and period < today.to_period("M")
+                    and run_dir.name == str(period) and not health.get("force_intramonth")
+                    and verify_package_manifest(run_dir)[0]):
+                packages.append((signal, run_dir))
+        except (KeyError, ValueError, OSError):
+            continue
+    if not packages:
+        raise FileNotFoundError("No completed monthly package; run monthly or specify --run-dir")
+    signal, run_dir = max(packages)
+    return run_dir, signal
 
 
 def sync_ops_excel(
@@ -117,9 +145,13 @@ def sync_ops_excel(
         else:
             sd = None
         if sd is None or pd.isna(sd):
-            _, sd = resolve_ops_month(asof)
+            _, sd = resolve_signal_month(asof)
     else:
-        run_dir, sd = resolve_ops_month(asof)
+        try:
+            run_dir, sd = (resolve_signal_month(asof) if create_if_missing else resolve_ops_month(asof))
+        except FileNotFoundError as exc:
+            print(f"excel_sync skipped: {exc}")
+            return None
 
     run_dir.mkdir(parents=True, exist_ok=True)
     need = ["health.json", "signals.csv", "target.csv"]
@@ -189,7 +221,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     print("  - quarantined: US-only ops (use research scripts if KR scrape needed)")
 
     print("data_panels:")
-    data_us = ROOT / "data" / "us"
+    from ops.us_hybrid_backtest import DATA, market_data_dir
+    data_us = market_data_dir(DATA)
     for name in [
         "us_prices_panel.parquet",
         "us_open_panel.parquet",
@@ -250,10 +283,9 @@ def cmd_refresh(args: argparse.Namespace) -> int:
 
     print(f"US refresh force={force} (validated atomic panels under data/us)")
     try:
-        meta = us.build_universe(top_n=TOP_N_DEFAULT, force_refresh=force)
+        meta, close, _open_px, volume, index_close, val = us.refresh_market_snapshot(
+            force=force, with_fundamentals=bool(getattr(args, "with_fundamentals", False)))
         codes = meta["Code"].astype(str).tolist()
-        close, _open_px, volume = us.load_prices(codes, force=force)
-        index_close = us.load_index(force=force)
     except Exception as exc:
         print(f"REFRESH BLOCKED - existing cache preserved: {type(exc).__name__}: {exc}")
         return 2
@@ -262,26 +294,8 @@ def cmd_refresh(args: argparse.Namespace) -> int:
         print(f"REFRESH BLOCKED - invalid staged coverage: prices={0 if close is None else close.shape[1]} required={min_codes}")
         return 2
 
-    val_max = None
-    try:
-        if getattr(args, "with_fundamentals", False):
-            print("fundamentals: downloading missing/forced via yfinance")
-            fund = us.download_fundamentals(codes, force=force)
-        elif us.CACHE_FUND.exists():
-            fund = pd.read_parquet(us.CACHE_FUND)
-            print(f"fundamentals: cache hit rows={len(fund)}")
-        else:
-            fund = pd.DataFrame()
-            print("fundamentals: none (valuation rebuild may be empty)")
-        fund_ttm = us.build_ttm(fund) if fund is not None and not fund.empty else pd.DataFrame()
-        val = us.build_valuation_panel(close, volume, fund_ttm, force=True)
-        if val is not None and not val.empty:
-            val_max = str(pd.to_datetime(val["date"]).max().date())
-            print(f"valuation: rebuilt rows={len(val)} max={val_max}")
-        else:
-            print("valuation: empty")
-    except Exception as e:
-        print(f"valuation rebuild skipped: {e}")
+    val_max = str(pd.to_datetime(val["date"]).max().date()) if not val.empty else None
+    snapshot = us.market_data_dir(us.DATA)
 
     n_codes = int(close.shape[1]) if close is not None and not close.empty else 0
     if close is not None and not close.empty:
@@ -304,10 +318,11 @@ def cmd_refresh(args: argparse.Namespace) -> int:
                 "valuation_max": val_max,
                 "force": force,
                 "paths": {
-                    "meta": str(us.CACHE_META),
-                    "prices": str(us.CACHE_PRICES),
-                    "index": str(us.CACHE_INDEX),
-                    "valuation": str(us.CACHE_VAL),
+                    "snapshot": str(snapshot),
+                    "meta": str(snapshot / us.CACHE_META.name),
+                    "prices": str(snapshot / us.CACHE_PRICES.name),
+                    "index": str(snapshot / us.CACHE_INDEX.name),
+                    "valuation": str(snapshot / us.CACHE_VAL.name),
                 },
             },
             ensure_ascii=False,
@@ -353,7 +368,7 @@ def cmd_monthly(args: argparse.Namespace) -> int:
             dest = Path(args.out_dir)
         else:
             try:
-                dest, _ = resolve_ops_month(args.asof)
+                dest, _ = resolve_signal_month(args.asof)
             except Exception:
                 dest = None
         # 3 = INTRA_MONTH_SIGNAL: no package write; stop before excel/next-steps noise
@@ -490,13 +505,7 @@ def cmd_rebalance(args: argparse.Namespace) -> int:
         try:
             from ops.ops_excel_write import write_ops_xlsx
 
-            toss_book = None
-            try:
-                from ops.ops_monthly_run import load_positions as _lp
-
-                toss_book = getattr(_lp, "last_toss_book", None)
-            except Exception:
-                toss_book = None
+            toss_book = summary.get("book")
             xpath = write_ops_xlsx(run_dir, positions=args.positions, toss_book=toss_book)
             print(f"  excel={xpath}")
         except PermissionError as e:
@@ -734,7 +743,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[List[str]] = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
-    code = args.func(args)
+    try:
+        code = args.func(args)
+    except FileNotFoundError as exc:
+        print(f"BLOCKED: {exc}")
+        code = 2
     raise SystemExit(code)
 
 

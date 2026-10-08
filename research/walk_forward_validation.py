@@ -18,9 +18,10 @@ from scipy import stats as scipy_stats
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from ops.us_factor_research import build_multi_picks, compute_all_features
-from ops.us_hybrid_backtest import market_regime, merge_sleeve_weights, weights_equal
+from ops.us_hybrid_backtest import market_regime, merge_sleeve_weights, weights_equal, market_data_dir
 from research.us_robust_strategy import VARIANTS
-from ops.ops_us_policy import POLICY_NAME, SLEEVE_WEIGHTS, MAX_NAME, select_us_picks
+from ops.ops_us_policy import POLICY_NAME, SLEEVE_WEIGHTS, MAX_NAME, build_us_target, policy_names
+from ops.ops_live_safety import validate_session_coverage, nyse_calendar
 
 COST = 0.001  # round trip: charge 5bp on each dollar bought or sold
 OUT = ROOT / 'results' / 'walk_forward_validation'
@@ -125,16 +126,31 @@ def make_targets(close, opens, volume, spy, specs, through):
     return result
 
 
+def validate_panels(frames):
+    """Check the complete declared IS/OOS window before any fold is reported."""
+    close, opens, volume, spy = frames
+    for label, frame in zip(('close', 'open', 'volume', 'SPY'), frames):
+        if frame.columns.has_duplicates or not close.index.equals(frame.index):
+            raise ValueError(f'Panel axes differ: {label}')
+        validate_session_coverage(frame.index, '2019-08-01', '2026-06-30', label)
+    if not close.columns.equals(opens.columns) or not close.columns.equals(volume.columns):
+        raise ValueError('Asset columns must align')
+    if 'Close' not in spy or not np.isfinite(spy.Close.loc['2019-08-01':'2026-06-30']).all():
+        raise ValueError('Missing benchmark prices')
+
+
 def candidate_main(data=None, output=None):
     data = data if data is not None else ROOT/'data'/'us'
+    data = market_data_dir(data)
     output = output if output is not None else OUT
     names = ['us_prices_panel', 'us_open_panel', 'us_volume_panel', 'spy']
     frames = [pd.read_parquet(data/(n+'.parquet')) for n in names]
     close, opens, volume, spy_frame = frames
     for frame in frames:
-        frame.index = pd.to_datetime(frame.index)
+        frame.index = pd.to_datetime(frame.index).tz_localize(None)
         if not frame.index.is_monotonic_increasing or frame.index.has_duplicates:
             raise ValueError('Invalid dates')
+    validate_panels(frames)
     spy = spy_frame['Close'].reindex(close.index)
     benchmark = spy.pct_change(fill_method=None)
     specs = [x for x in VARIANTS if x['family'] == 'robust']
@@ -143,8 +159,8 @@ def candidate_main(data=None, output=None):
         start = pd.Timestamp('2024-01-01') + pd.DateOffset(months=6*i)
         end = start + pd.DateOffset(months=6)-pd.Timedelta(days=1)
         train_end = close.index[close.index < start][-1]
-        if close.index[-1] < end-pd.Timedelta(days=3):
-            raise ValueError('Incomplete test interval')
+        for name, frame in zip(names, frames):
+            validate_session_coverage(frame.index, '2019-08-01', end, name)
         train_targets = make_targets(close, opens, volume, spy, specs, train_end)
         train = pd.DataFrame({n: simulate(close, opens, t, '2019-08-01', train_end)['return_']
                               for n, t in train_targets.items()})
@@ -186,11 +202,13 @@ def month_end_signals(index):
     index = pd.DatetimeIndex(index)
     last = index[-1]
     ends = pd.Series(index, index=index).groupby(index.to_period('M')).last()
-    return pd.DatetimeIndex([d for d in ends if d.to_period('M') < last.to_period('M')])
+    calendar = nyse_calendar(index[0], last + pd.offsets.MonthEnd(0))
+    return pd.DatetimeIndex([d for d in ends if d == calendar.sessions_in_range(
+        d.to_period('M').start_time.normalize(), d.to_period('M').end_time.normalize())[-1]])
 
 
-def fixed_targets(close, volume, spy, through, top_n=150):
-    """Frozen production selectors; trailing liquidity screen at each signal.
+def fixed_targets(close, volume, spy, through, top_n=150, *, universe=None):
+    """Frozen production snapshot order, observation eligibility and selectors.
 
     Truncation makes any changes beyond through irrelevant to these targets.
     Rank only available cached names: historical S&P membership is unavailable.
@@ -201,24 +219,9 @@ def fixed_targets(close, volume, spy, through, top_n=150):
     signals = month_end_signals(c.index)
     targets, audit = {}, []
     for day in signals[signals >= pd.Timestamp('2019-07-01')]:
-        amount = (c.loc[:day].tail(20)*v.loc[:day].tail(20)).mean()
-        eligible = (c.loc[day].notna() & (c.loc[day] > 0)
-                    & (c.loc[:day].tail(252).notna().sum() >= 252)
-                    & amount.notna() & (amount > 0))
-        names = amount[eligible].sort_values(ascending=False, kind='stable').head(top_n).index
-        # Mask selectors rather than recompute cross-sectional ranks after filtering.
-        masked = {}
-        for key, frame in feats.items():
-            masked[key] = frame.loc[[day]].astype(float).copy()
-            masked[key].loc[day, ~masked[key].columns.isin(names)] = np.nan
-        picks, _ = select_us_picks(day, masked, c, v, regime)
-        name_weights = {k: weights_equal(codes) for k, codes in picks.items()}
-        sleeve_weights = dict(SLEEVE_WEIGHTS)
-        sleeve_weights['cash'] = sum(w for k, w in SLEEVE_WEIGHTS.items() if not picks[k])
-        for k in SLEEVE_WEIGHTS:
-            if not picks[k]:
-                sleeve_weights[k] = 0.0
-        target = merge_sleeve_weights(sleeve_weights, name_weights, max_name=MAX_NAME)
+        names = policy_names(day, c, universe, top_n)
+        picks, target, _, _ = build_us_target(day, feats, c, v, regime,
+                                             universe=universe, top_n=top_n)
         if set(target)-set(names) or max(target.values(), default=0) > MAX_NAME+1e-9:
             raise ValueError('Universe/name cap violation')
         pos = c.index.searchsorted(day, side='right')
@@ -275,6 +278,7 @@ def regime_labels(spy):
 
 
 def fixed_main(data_dir, output_dir):
+    data_dir = market_data_dir(data_dir)
     names = ['us_prices_panel', 'us_open_panel', 'us_volume_panel', 'spy']
     frames = [pd.read_parquet(data_dir/(n+'.parquet')) for n in names]
     for frame in frames:
@@ -282,6 +286,13 @@ def fixed_main(data_dir, output_dir):
         if not frame.index.is_monotonic_increasing or frame.index.has_duplicates or frame.columns.has_duplicates:
             raise ValueError('Invalid panel axes')
     close, opens, volume, spy_frame = frames
+    validate_panels(frames)
+    meta_path = data_dir/'us_universe_meta.parquet'
+    if not meta_path.exists():
+        raise ValueError('Fixed validation requires the production us_universe_meta.parquet snapshot')
+    universe = pd.read_parquet(meta_path)
+    if 'Code' not in universe or universe.Code.duplicated().any():
+        raise ValueError('Invalid production universe metadata')
     if any(not close.index.equals(f.index) for f in frames[1:]):
         raise ValueError('Panels must have identical observation dates')
     if not close.columns.equals(opens.columns) or not close.columns.equals(volume.columns):
@@ -293,12 +304,12 @@ def fixed_main(data_dir, output_dir):
     for i in range(5):
         start = pd.Timestamp('2024-01-01') + pd.DateOffset(months=6*i)
         end = start+pd.DateOffset(months=6)-pd.Timedelta(days=1)
-        if close.index[-1] < end-pd.Timedelta(days=3):
-            raise ValueError('Incomplete OOS fold')
+        for name, frame in zip(names, frames):
+            validate_session_coverage(frame.index, '2019-08-01', end, name)
         train_end = close.index[close.index < start][-1]
-        train_targets, _ = fixed_targets(close, volume, spy, train_end)
+        train_targets, _ = fixed_targets(close, volume, spy, train_end, universe=universe)
         train = simulate(close, opens, train_targets, '2019-08-01', train_end)
-        test_targets, audit = fixed_targets(close, volume, spy, end)
+        test_targets, audit = fixed_targets(close, volume, spy, end, universe=universe)
         test = simulate(close, opens, test_targets, start, end)
         test['benchmark'] = benchmark.reindex(test.index)
         test['regime'] = labels.reindex(test.index)
@@ -332,7 +343,7 @@ def fixed_main(data_dir, output_dir):
         tuning='none; 60/20/20 weights and selectors fixed for every fold',
         execution='month-end close signal; next observed trading-day open; cash start and close liquidation per fold',
         round_trip_cost_bps=10, one_way_cost_bps=5, name_cap=MAX_NAME,
-        universe='trailing 20-session mean dollar volume top 150 among cached names with 252 valid sessions',
+        universe='production metadata order top 150; >=200 valid observations through signal; shared policy selectors',
         cached_names=len(close.columns), regime='previous-close SMA200 trend x RV21 above/below trailing 252-day median',
         inference='paired monthly strategy minus SPY returns on stitched OOS only; two-sided t-test',
         sector='no historical sector mapping/cap in this validation; production sector handling is best effort'),
@@ -344,7 +355,8 @@ def fixed_main(data_dir, output_dir):
         'No spread/slippage/impact model beyond 10bp round-trip cost; not live performance.'],
         folds=folds, stitched_strategy=metrics(daily.return_), stitched_benchmark=metrics(daily.benchmark),
         statistics=statistics, regimes=regimes,
-        input_sha256={n: hashlib.sha256((data_dir/(n+'.parquet')).read_bytes()).hexdigest() for n in names})
+        input_sha256={n: hashlib.sha256((data_dir/(n+'.parquet')).read_bytes()).hexdigest()
+                      for n in [*names, 'us_universe_meta']})
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir/'metrics.json').write_text(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False), encoding='utf-8')
     daily.to_csv(output_dir/'oos_returns.csv', index_label='date')

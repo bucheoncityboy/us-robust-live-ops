@@ -64,9 +64,9 @@ for (const bootstrap of [report.statistics.iid, report.statistics.block4]) {
   assert.ok(bootstrap.fraction_mean_above_zero >= 0 && bootstrap.fraction_mean_above_zero <= 1);
 }
 const tests = spawnSync(process.env.VALIDATION_PYTHON ?? 'python',
-  ['-m', 'unittest', 'discover', '-s', 'tests', '-p', 'test_walk_forward_validation.py', '-v'],
+  ['-m', 'pytest', 'tests/', '-q', '--disable-warnings', '--tb=short'],
   { cwd: root, encoding: 'utf8' });
 process.stdout.write(tests.stdout);
 process.stderr.write(tests.stderr);
 assert.equal(tests.status, 0, tests.error?.message ?? 'Python validation tests failed');
-console.log(`Verified ${daily.length} OOS sessions, ${months.size} months, five folds and statistical results.`);
+console.log(`Verified archived ${daily.length} OOS sessions, ${months.size} months, five folds and statistical results; current safety and WFA regressions passed.`);

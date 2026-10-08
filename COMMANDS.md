@@ -19,8 +19,8 @@ python ops.py weekly
 ```bash
 # Local cached panels only; this research entrypoint does not import the broker.
 python research/walk_forward_validation.py --mode fixed --data-dir data/us
-# An existing 0719 cache can be used directly on Windows:
-python research/walk_forward_validation.py --mode fixed --data-dir "C:/Users/PC/Desktop/AI/0719/data/us"
+# Fixed mode needs all four price panels plus us_universe_meta.parquet from the same snapshot.
+# Set VALIDATION_PYTHON to the Python 3.11 environment containing requirements.txt.
 npm ci
 npm run check
 npx tsx src/harness.ts
@@ -36,13 +36,18 @@ t-test, 10,000 IID draws and 10,000 circular four-month block draws, plus a
 signal/target audit. The 60/20/20 policy is fixed; IS is diagnostic, with no refit.
 Candidate mode writes `results/walk_forward_validation/`.
 
+Both modes require every declared NYSE session through 2026-06-30 and reject
+missing internal/final sessions before computing folds. If current_snapshot.json
+exists, readers pin the published version. Stored results predate the audit fixes;
+new downloads do not reproduce the original cache hashes or archived performance.
+
 ## Monthly standard procedure
 
 ```bash
 # 0) status (+ excel sync of an existing month package)
 python ops.py status
 
-# 1) refresh US yfinance panels + valuation rebuild (+ excel sync)
+# 1) stage and validate the complete market snapshot, then atomically publish it (+ excel sync)
 python ops.py refresh
 python ops.py refresh --smart
 python ops.py refresh --with-fundamentals
@@ -54,6 +59,7 @@ python ops.py monthly --capital 100000
 python ops.py monthly --asof 2026-06-30
 
 # 6) rebuild buy/sell ticket from frozen target + live book
+# Default package lookup selects the latest completed existing package, not the price tail's current month.
 python ops.py rebalance
 python ops.py rebalance --capital 100000
 
@@ -68,8 +74,9 @@ python ops.py execute --run-dir results/ops_runs/2026-06 --risk-mode L2
 
 # 8) weekly live NAV + SPY snapshot (week-end anchor)
 python ops.py weekly
-# Mon-Thu runs are a clean no-op; Sat/Sun runs record the prior Friday
-# anchor row in place. Missed weeks are backfilled on the next anchor run.
+# Runs before the XNYS week's final session close are a clean no-op.
+# Sat/Sun runs require the completed anchor's SPY close; holidays/early closes are accounted for.
+# Missed weeks are backfilled on the next anchor run.
 ```
 
 `status` / `refresh` / `monthly` / `rebalance` refresh

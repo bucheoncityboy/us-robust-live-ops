@@ -335,7 +335,8 @@ def compute_month_end_readiness(
     if instant.tzinfo is None:
         instant = instant.replace(tzinfo=timezone.utc)
     now_ny = instant.astimezone(NY)
-    actual = _parquet_latest_date(Path(prices_path or CACHE_PRICES))
+    from ops.us_hybrid_backtest import market_cache_path
+    actual = _parquet_latest_date(Path(prices_path) if prices_path else market_cache_path(CACHE_PRICES))
 
     reasons: List[str] = []
     if expected is None:

@@ -42,6 +42,27 @@ def ny_today(now: Optional[Any] = None) -> date:
     return ts.tz_convert(NY_TZ).date()
 
 
+def nyse_calendar(start, end):
+    """Offline exchange calendar, including holidays and early closes."""
+    import exchange_calendars as xcals
+    first = pd.Timestamp(start).tz_localize(None).normalize()
+    last = pd.Timestamp(end).tz_localize(None).normalize()
+    return xcals.get_calendar("XNYS", start=first - pd.Timedelta(days=8),
+                              end=last + pd.Timedelta(days=8))
+
+
+def validate_session_coverage(index, start, end, label: str = "panel") -> None:
+    """Require every scheduled session, including the final one, with no extras."""
+    expected = nyse_calendar(start, end).sessions_in_range(start, end)
+    observed = pd.DatetimeIndex(index).tz_localize(None)
+    observed = observed[(observed >= pd.Timestamp(start)) & (observed <= pd.Timestamp(end))]
+    missing, extra = expected.difference(observed), observed.difference(expected)
+    if observed.has_duplicates or not observed.is_monotonic_increasing or len(missing) or len(extra):
+        raise ValueError(f"Incomplete or invalid NYSE sessions ({label}): "
+                         f"missing={list(missing.strftime('%Y-%m-%d')[:8])} "
+                         f"extra={list(extra.strftime('%Y-%m-%d')[:8])}")
+
+
 def atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> Path:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)

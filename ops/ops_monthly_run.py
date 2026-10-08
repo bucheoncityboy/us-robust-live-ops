@@ -35,7 +35,6 @@ from ops.ops_us_policy import (
     WEIGHT_EPS,
     WEIGHT_MODE,
     normalize_symbol,
-    select_us_picks,
 )
 from ops.us_factor_research import compute_all_features
 from ops.ops_live_safety import (
@@ -53,22 +52,13 @@ from ops.ops_live_safety import (
 from ops.us_hybrid_backtest import (
     CACHE_VAL,
     DATA,
-    build_universe,
-    load_index,
-    load_prices,
     market_regime,
-    merge_sleeve_weights,
     month_ends,
-    weights_equal,
+    market_data_dir,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT_ROOT = ROOT / "results" / "ops_runs"
-
-# Module cache so build_target keeps the historical 5-arg signature used by callers/tests.
-_LAST_CLOSE: Optional[pd.DataFrame] = None
-_LAST_VOLUME: Optional[pd.DataFrame] = None
-_LAST_OPEN: Optional[pd.DataFrame] = None
 
 FRACTIONAL_SHARES_DEFAULT = True  # US fractional shares; do not floor to whole shares
 
@@ -77,27 +67,27 @@ LAG_BLOCK_PRICES = 3
 LAG_WARN_VAL = 40
 
 
-def load_market(top_n: int = TOP_N_DEFAULT):
+def load_market(top_n: int = TOP_N_DEFAULT, *, include_open: bool = False):
     """Load US Robust market panels from data/us (yfinance SoT).
 
     Returns the historical 11-tuple shape for callers:
       close, volume, index_close, regime, feats, frgn_feats, val, meta, name_map, sector_map, frgn
     frgn / frgn_feats are empty placeholders (no KR foreign path).
     """
-    global _LAST_CLOSE, _LAST_VOLUME, _LAST_OPEN
-
-    meta = build_universe(top_n=top_n)
+    snapshot = market_data_dir(DATA)
+    meta = pd.read_parquet(snapshot / "us_universe_meta.parquet")
     if meta is None or meta.empty:
         raise FileNotFoundError(f"missing US universe meta under {DATA}")
     meta = meta.copy()
     meta["Code"] = meta["Code"].map(normalize_symbol)
     meta = meta[meta["Code"].astype(bool)].reset_index(drop=True)
     if "Marcap" in meta.columns:
-        meta = meta.sort_values("Marcap", ascending=False)
+        meta = meta.sort_values("Marcap", ascending=False, kind="stable")
     meta = meta.head(top_n).reset_index(drop=True)
     codes = meta["Code"].tolist()
 
-    close, open_px, volume = load_prices(codes, force=False)
+    close, open_px, volume = [pd.read_parquet(snapshot / name) for name in
+                             ("us_prices_panel.parquet", "us_open_panel.parquet", "us_volume_panel.parquet")]
     close = close.copy()
     open_px = open_px.copy()
     volume = volume.copy()
@@ -123,13 +113,12 @@ def load_market(top_n: int = TOP_N_DEFAULT):
         open_px = open_px.reindex(columns=codes)
         volume = volume.reindex(columns=codes).fillna(0.0)
 
-    valid = close.notna().sum() >= 200
-    close = close.loc[:, valid].sort_index()
+    close = close.sort_index()
     open_px = open_px.reindex(columns=close.columns).reindex(close.index)
     volume = volume.reindex(columns=close.columns).reindex(close.index).fillna(0.0)
     meta = meta[meta["Code"].isin(set(close.columns))].reset_index(drop=True)
 
-    index_close = load_index(force=False)
+    index_close = pd.read_parquet(snapshot / "spy.parquet")["Close"]
     index_close.index = pd.to_datetime(index_close.index).tz_localize(None)
     index_close = index_close.reindex(close.index).ffill()
     if index_close.isna().all():
@@ -149,8 +138,8 @@ def load_market(top_n: int = TOP_N_DEFAULT):
     }
 
     val = pd.DataFrame()
-    if CACHE_VAL.exists():
-        val = pd.read_parquet(CACHE_VAL)
+    if (snapshot / CACHE_VAL.name).exists():
+        val = pd.read_parquet(snapshot / CACHE_VAL.name)
         if not val.empty:
             val = val.copy()
             val["date"] = pd.to_datetime(val["date"])
@@ -184,10 +173,8 @@ def load_market(top_n: int = TOP_N_DEFAULT):
                 if sector_map:
                     break
 
-    _LAST_CLOSE = close
-    _LAST_VOLUME = volume
-    _LAST_OPEN = open_px
-    return close, volume, index_close, regime, feats, frgn_feats, val, meta, name_map, sector_map, frgn
+    market = (close, volume, index_close, regime, feats, frgn_feats, val, meta, name_map, sector_map, frgn)
+    return (*market, open_px) if include_open else market
 
 
 def pick_signal_date(close: pd.DataFrame, asof: Optional[str]) -> pd.Timestamp:
@@ -298,51 +285,20 @@ def build_target(
     regime: pd.Series,
     close: Optional[pd.DataFrame] = None,
     volume: Optional[pd.DataFrame] = None,
+    *,
+    universe: Optional[pd.DataFrame] = None,
+    top_n: int = TOP_N_DEFAULT,
 ) -> Tuple[Dict[str, List[str]], Dict[str, float], Dict[str, Dict[str, float]], str]:
     """US Robust equal-within-sleeve target. No hybrid SCORE / select_* path.
 
     Empty sleeves become cash (do not silently boost other sleeves).
     Name-cap leftovers also remain as residual cash (weights may sum < 1).
     """
-    reg = regime.loc[date] if date in regime.index else "sideways"
-    if not isinstance(reg, str):
-        reg = str(reg)
+    if close is None or volume is None:
+        raise ValueError("build_target requires explicit close and volume panels")
+    return uspol.build_us_target(date, feats, close, volume, regime,
+                                 universe=universe, top_n=top_n)
 
-    close_px = close if close is not None else _LAST_CLOSE
-    vol_px = volume if volume is not None else _LAST_VOLUME
-    if close_px is None or vol_px is None:
-        raise RuntimeError("build_target requires load_market() first (close/volume cache empty)")
-
-    picks, _scores = select_us_picks(
-        date,
-        feats,
-        close_px,
-        vol_px,
-        regime,
-        n_leader=N_LEADER,
-        n_mom63=N_MOM63,
-        n_lowvol=N_LOWVOL,
-    )
-
-    name_w: Dict[str, Dict[str, float]] = {}
-    for sleeve, codes in picks.items():
-        if not codes:
-            name_w[sleeve] = {}
-            continue
-        w = weights_equal(codes)
-        name_w[sleeve] = {normalize_symbol(k): float(v) for k, v in w.items() if normalize_symbol(k)}
-
-    sleeve_w = dict(SLEEVE_WEIGHTS)
-    cash = float(sleeve_w.get("cash", 0.0) or 0.0)
-    for sleeve in ("leader", "mom63", "lowvol"):
-        if not name_w.get(sleeve):
-            cash += float(sleeve_w.get(sleeve, 0.0) or 0.0)
-            sleeve_w[sleeve] = 0.0
-    if cash > 0:
-        sleeve_w["cash"] = cash
-    final = merge_sleeve_weights(sleeve_w, name_w, max_name=MAX_NAME)
-    final = {normalize_symbol(k): float(v) for k, v in final.items() if float(v) > 0 and normalize_symbol(k)}
-    return picks, final, name_w, reg
 
 def panel_last_date(df: pd.DataFrame, kind: str) -> Optional[str]:
     if df is None or (isinstance(df, pd.DataFrame) and df.empty):
@@ -475,18 +431,18 @@ def build_health(
     }
 
 
-def load_positions(path: Optional[str]) -> Dict[str, float]:
+def load_position_context(path: Optional[str]) -> Tuple[Dict[str, float], Optional[Dict]]:
     """Load current weights from CSV path or live Toss ('toss').
 
     Empty book: None / '' / none / off / empty / flat
     Live Toss: toss (default in CLI)
     """
     if path is None:
-        return {}
+        return {}, None
     src = str(path).strip()
     if not src or src.lower() in {"none", "off", "empty", "flat", "-", "null"}:
         print("  positions=none (empty book)")
-        return {}
+        return {}, None
     if src.lower() in {"toss", "toss://", "toss:live"}:
         from ops.toss_portfolio import fetch_portfolio, us_weights
 
@@ -498,9 +454,7 @@ def load_positions(path: Optional[str]) -> Dict[str, float]:
             f"ops_ready={book.get('ops_ready')} flat={book.get('flat')} "
             f"cash_usd={float(book.get('cash_usd') or 0):.2f}"
         )
-        # stash for excel writer in same process
-        load_positions.last_toss_book = book  # type: ignore[attr-defined]
-        return w
+        return w, book
 
     p = Path(src)
     if not p.exists():
@@ -523,7 +477,12 @@ def load_positions(path: Optional[str]) -> Dict[str, float]:
     s = sum(out.values())
     if s > 0 and abs(s - 1.0) > 1e-3:
         out = {k: v / s for k, v in out.items()}
-    return out
+    return out, None
+
+
+def load_positions(path: Optional[str]) -> Dict[str, float]:
+    """Compatibility weights-only API; never stores broker state."""
+    return load_position_context(path)[0]
 
 
 
@@ -633,14 +592,18 @@ def attach_share_sizes(
         except Exception:
             pxrow = None
     if pxrow is None and close is not None and len(close):
-        if signal_date is not None and signal_date in close.index:
-            pxrow = close.loc[signal_date]
-        else:
-            pxrow = close.iloc[-1]
-        pxrow = pxrow.copy()
-        px_kind = "yfinance_close"
+        prior = close.loc[:signal_date] if signal_date is not None else close
+        if len(prior):
+            pxrow = prior.iloc[-1].copy()
+            px_kind = "yfinance_close"
     if pxrow is not None:
         pxrow.index = [normalize_symbol(c) for c in pxrow.index]
+    fallback = None
+    if close is not None and len(close):
+        prior = close.loc[:signal_date] if signal_date is not None else close
+        if len(prior):
+            fallback = prior.iloc[-1].copy()
+            fallback.index = [normalize_symbol(c) for c in fallback.index]
 
     for o in orders:
         code = normalize_symbol(o.get("code"))
@@ -649,17 +612,21 @@ def attach_share_sizes(
         o["fractional"] = bool(fractional)
         px = None
         px_source = "none"
-        if live_px and code in live_px and float(live_px.get(code) or 0) > 0:
+        if live_px and code in live_px and np.isfinite(float(live_px.get(code) or 0)) and float(live_px.get(code) or 0) > 0:
             px = float(live_px[code])
             px_source = "toss"
         elif pxrow is not None and code in pxrow.index:
             try:
                 v = float(pxrow[code])
-                if v > 0 and v == v:
+                if v > 0 and np.isfinite(v):
                     px = v
                     px_source = px_kind
             except Exception:
                 px = None
+        if px is None and fallback is not None and code in fallback:
+            value = float(fallback[code])
+            if np.isfinite(value) and value > 0:
+                px, px_source = value, "yfinance_signal_close"
         o["est_px"] = px
         o["px_source"] = px_source
         tw = float(o.get("target_w") or 0.0)
@@ -739,7 +706,11 @@ def validate_share_sizing(
     buys = [o for o in orders if o.get("side") == "BUY"]
     sells = [o for o in orders if o.get("side") == "SELL"]
     zero_buy = [o for o in buys if o.get("qty") in (0, None)]
-    no_px = [o for o in orders if not o.get("est_px")]
+    required = buys + sells
+    no_px = [o for o in required if o.get("est_px") is None
+             or not np.isfinite(float(o["est_px"])) or float(o["est_px"]) <= 0]
+    bad_qty = [o for o in required if o.get("qty") is None
+               or not np.isfinite(float(o["qty"])) or float(o["qty"]) <= 0]
     residual = [o for o in buys if o.get("qty_note") == "residual_1share"]
     below = [o for o in buys if o.get("qty_note") in ("below_1share", "zero_after_round")]
     buy_notional = 0.0
@@ -787,6 +758,7 @@ def validate_share_sizing(
         "n_sell": len(sells),
         "n_buy_zero_qty": len(zero_buy),
         "n_no_price": len(no_px),
+        "required_orders": [{"code": o["code"], "side": o["side"]} for o in required],
         "n_residual_1share": len(residual),
         "n_below_1share": len(below),
         "buy_notional": buy_notional,
@@ -811,6 +783,7 @@ def validate_share_sizing(
     if cash_val is not None and cash_shortfall is not None and cash_shortfall > 1.0:
         warns.append(f"cash_shortfall:{cash_shortfall:.0f}")
     out["warnings"] = warns
+    out["errors"] = (["missing_prices"] if no_px else []) + (["invalid_quantities"] if bad_qty else [])
     return out
 
 
@@ -1030,15 +1003,7 @@ def rebuild_rebalance_ticket(
     if pd.isna(signal_date):
         signal_date = pd.Timestamp.now().normalize()
 
-    # live book -> current weights
-    # clear previous process stash
-    if hasattr(load_positions, "last_toss_book"):
-        try:
-            delattr(load_positions, "last_toss_book")
-        except Exception:
-            pass
-    current = load_positions(positions)
-    book = getattr(load_positions, "last_toss_book", None)
+    current, book = load_position_context(positions)
     live_px = {}
     live_qty = {}
     if book is not None:
@@ -1059,37 +1024,29 @@ def rebuild_rebalance_ticket(
 
     # prices for qty sizing (panel: MultiIndex date/Code, OHLCV columns)
     # prices for qty sizing from US close cache / parquet
-    if _LAST_CLOSE is not None and not _LAST_CLOSE.empty:
-        close = _LAST_CLOSE.copy()
-        close.index = pd.to_datetime(close.index)
-        close.columns = [normalize_symbol(c) for c in close.columns]
-    else:
-        from ops.us_hybrid_backtest import CACHE_PRICES
-
-        if not CACHE_PRICES.exists():
-            raise FileNotFoundError(f"missing US prices panel: {CACHE_PRICES}")
-        close = pd.read_parquet(CACHE_PRICES)
-        close.index = pd.to_datetime(close.index)
-        close.columns = [normalize_symbol(c) for c in close.columns]
+    from ops.us_hybrid_backtest import DATA, market_data_dir
+    snapshot = market_data_dir(DATA)
+    prices_path = snapshot / "us_prices_panel.parquet"
+    if not prices_path.exists():
+        raise FileNotFoundError(f"missing US prices panel: {prices_path}")
+    close = pd.read_parquet(prices_path)
+    close.index = pd.to_datetime(close.index)
+    close.columns = [normalize_symbol(c) for c in close.columns]
 
     cap, cap_src = resolve_capital_usd(book=book, capital_usd=capital_usd)
     open_px = None
-    try:
-        from ops.us_hybrid_backtest import CACHE_OPEN
-
-        if CACHE_OPEN.exists():
-            open_px = pd.read_parquet(CACHE_OPEN)
-            open_px.index = pd.to_datetime(open_px.index)
-            open_px.columns = [normalize_symbol(c) for c in open_px.columns]
-    except Exception:
-        open_px = _LAST_OPEN
+    open_path = snapshot / "us_open_panel.parquet"
+    if open_path.exists():
+        open_px = pd.read_parquet(open_path)
+        open_px.index = pd.to_datetime(open_px.index)
+        open_px.columns = [normalize_symbol(c) for c in open_px.columns]
 
     orders = attach_share_sizes(
         orders,
         close,
         cap,
         capital_source=cap_src,
-        signal_date=signal_date if signal_date in close.index else None,
+        signal_date=signal_date,
         fractional=FRACTIONAL_SHARES_DEFAULT,
         live_px=live_px,
         live_qty=live_qty,
@@ -1103,7 +1060,7 @@ def rebuild_rebalance_ticket(
             cash_for_size = None
     sizing = validate_share_sizing(orders, cap, cash_usd=cash_for_size)
 
-    sizing_errors = []
+    sizing_errors = list(sizing["errors"])
     if cap and sizing["n_buy"] > 0 and sizing["n_buy_zero_qty"] == sizing["n_buy"]:
         sizing_errors.append("all_buy_qty_zero")
     if cap and sizing["n_no_price"] > 0:
@@ -1142,12 +1099,17 @@ def rebuild_rebalance_ticket(
     }
     # drop prior sizing reasons then re-add
     reasons = [r for r in (health.get("reasons") or []) if not str(r).startswith("sizing:")]
+    prior_sizing = [r for r in (health.get("reasons") or []) if str(r).startswith("sizing:")]
     if sizing_errors:
+        health.setdefault("status_before_sizing", health.get("status", "OK"))
         reasons.extend([f"sizing:{e}" for e in sizing_errors])
-        if health.get("status") == "OK":
-            health["status"] = "WARN"
+        health["status"] = "BLOCK"
+    elif prior_sizing:
+        health["status"] = health.pop("status_before_sizing", "WARN" if reasons else "OK")
     health["reasons"] = reasons
 
+    if book is None:
+        health.pop("toss", None)
     if positions and str(positions).strip().lower() in {"toss", "toss://", "toss:live"} and book:
         health["toss"] = {
             "status": book.get("status"),
@@ -1201,7 +1163,7 @@ def rebuild_rebalance_ticket(
     (run_dir / "rebalance_ticket.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    return summary
+    return {**summary, "book": book}
 
 def run(
     asof: Optional[str] = None,
@@ -1218,7 +1180,7 @@ def run(
         print("NOTE: --refresh-data is deprecated here; use `python ops.py refresh` instead.")
 
     print("step 2/5 종목 선정")
-    close, volume, index_close, regime, feats, frgn_feats, val, meta, name_map, sector_map, frgn = load_market(top_n)
+    close, volume, index_close, regime, feats, frgn_feats, val, meta, name_map, sector_map, frgn, open_px = load_market(top_n, include_open=True)
     signal_date = pick_signal_date(close, asof)
     assert_final_month_end_signal(
         signal_date,
@@ -1226,7 +1188,8 @@ def run(
         asof=asof,
         force_intramonth=force_intramonth,
     )
-    picks, final_w, name_w, reg = build_target(signal_date, feats, frgn_feats, val, regime)
+    picks, final_w, name_w, reg = build_target(signal_date, feats, frgn_feats, val, regime,
+                                             close, volume, universe=meta, top_n=top_n)
     sm = score_maps(signal_date, feats, frgn_feats, val_snap_on(val, signal_date))
     print(
         f"  signal_date={signal_date.date()}  "
@@ -1239,7 +1202,7 @@ def run(
     print(f"  n_names={len(final_w)} weight_sum={sum(final_w.values()):.6f} max_name={max(final_w.values()) if final_w else None}")
 
     print("step 4/5 주문 미리보기")
-    current = load_positions(positions)
+    current, book = load_position_context(positions)
     sleeve_of = {}
     for c in final_w:
         sleeves = [s for s, codes in picks.items() if c in codes]
@@ -1247,7 +1210,6 @@ def run(
     orders = classify_actions(final_w, current, sleeve_of=sleeve_of)
     for o in orders:
         o["name"] = name_map.get(o["code"], "")
-    book = getattr(load_positions, "last_toss_book", None)
     live_px = {}
     live_qty = {}
     if book is not None:
@@ -1259,7 +1221,7 @@ def run(
     orders = attach_share_sizes(
         orders, close, cap, capital_source=cap_src, signal_date=signal_date,
         fractional=FRACTIONAL_SHARES_DEFAULT, live_px=live_px, live_qty=live_qty,
-        open_px=_LAST_OPEN,
+        open_px=open_px,
     )
     cash_for_size = None
     if book is not None:
@@ -1299,7 +1261,7 @@ def run(
     if sizing["no_price_codes"]:
         print("  no_price_codes", ", ".join(sizing["no_price_codes"]))
     # Hard consistency checks (fail loud in health, not silent)
-    sizing_errors = []
+    sizing_errors = list(sizing["errors"])
     if cap and sizing["n_buy"] > 0 and sizing["n_buy_zero_qty"] == sizing["n_buy"]:
         sizing_errors.append("all_buy_qty_zero")
     if cap and sizing["n_no_price"] > 0:
@@ -1320,13 +1282,10 @@ def run(
     health["capital_source"] = cap_src
     health["sizing"] = sizing
     if sizing.get("errors"):
+        health["status_before_sizing"] = health["status"]
         health.setdefault("reasons", []).extend([f"sizing:{e}" for e in sizing["errors"]])
-        # keep status unless already BLOCK; sizing issues are WARN-level by default
-        if health.get("status") == "OK":
-            health["status"] = "WARN"
+        health["status"] = "BLOCK"
     # attach toss status into health for excel (no secrets)
-    if positions and str(positions).strip().lower() in {"toss", "toss://", "toss:live"}:
-        book = getattr(load_positions, "last_toss_book", None)
     live_px = {}
     live_qty = {}
     if book is not None:
@@ -1368,8 +1327,7 @@ def run(
     if write_xlsx:
         from ops.ops_excel_write import write_ops_xlsx
 
-        toss_book = getattr(load_positions, "last_toss_book", None)
-        xpath = write_ops_xlsx(dest, positions=positions, toss_book=toss_book)
+        xpath = write_ops_xlsx(dest, positions=positions, toss_book=book)
         print(f"  excel={xpath}")
     else:
         print("  excel=skipped (--no-xlsx)")

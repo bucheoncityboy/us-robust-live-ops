@@ -300,6 +300,7 @@ def evaluate_gates(
     cash_usd: Optional[float] = None,
     post_sell_cash_usd: Optional[float] = None,
     confirm_high_value: bool = False,
+    orders: Optional[pd.DataFrame] = None,
 ) -> GateResult:
     """Phase A: pre-send. Phase B: after all SELL full-fill, before BUY."""
     reasons: List[str] = []
@@ -326,6 +327,16 @@ def evaluate_gates(
 
     if status == "BLOCK":
         reasons.append("health_BLOCK")
+    reasons.extend(f"sizing:{error}" for error in sizing.get("errors", []))
+    required = (orders.to_dict("records") if orders is not None
+                else sizing.get("required_orders", []))
+    expected = [(zcode(r.get("code")), str(r.get("side", "")).upper())
+                for r in required if str(r.get("side", "")).upper() in
+                ({"BUY", "SELL"} if phase == "A" else {"BUY"})]
+    actual = [(zcode(r.get("code")), r.get("side")) for r in sendable
+              if phase == "A" or r.get("side") == "BUY"]
+    if sorted(expected) != sorted(actual) and (orders is not None or "required_orders" in sizing):
+        reasons.append("order_basket_incomplete_or_changed")
 
     reasons.extend(validate_unique_rows(sendable))
 

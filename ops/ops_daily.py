@@ -38,6 +38,7 @@ weekly returns on those days (not flow-adjusted).
 from __future__ import annotations
 
 import sys
+import math
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -76,7 +77,6 @@ def _sleeve_map() -> Dict[str, str]:
         out[code] = "+".join(sorted(str(s) for s in grp["sleeve"]))
     return out
 
-_CLOSE_PANEL: Optional[pd.DataFrame] = None
 
 
 def _spy_series() -> Optional[pd.Series]:
@@ -87,11 +87,12 @@ def _spy_series() -> Optional[pd.Series]:
     NOT require a full `python ops.py refresh`.
     """
     from ops.ops_live_safety import ny_today
-    from ops.us_hybrid_backtest import CACHE_INDEX
+    from ops.us_hybrid_backtest import CACHE_INDEX, market_cache_path
+    index_path = market_cache_path(CACHE_INDEX)
 
     base = None
-    if CACHE_INDEX.exists():
-        df = pd.read_parquet(CACHE_INDEX)
+    if index_path.exists():
+        df = pd.read_parquet(index_path)
         if not df.empty:
             s = df.iloc[:, 0].astype(float)
             s.index = pd.to_datetime(df.index)
@@ -123,17 +124,14 @@ def _spy_series() -> Optional[pd.Series]:
 
 def load_close_panel() -> Optional[pd.DataFrame]:
     """US close-price panel (index=datetime, columns=ticker, values=close)."""
-    global _CLOSE_PANEL
-    if _CLOSE_PANEL is not None:
-        return _CLOSE_PANEL
-    from ops.us_hybrid_backtest import CACHE_PRICES
+    from ops.us_hybrid_backtest import CACHE_PRICES, market_cache_path
+    prices_path = market_cache_path(CACHE_PRICES)
 
-    if not CACHE_PRICES.exists():
+    if not prices_path.exists():
         return None
-    df = pd.read_parquet(CACHE_PRICES)
+    df = pd.read_parquet(prices_path)
     df.index = pd.to_datetime(df.index)
     df.columns = [str(c) for c in df.columns]
-    _CLOSE_PANEL = df
     return df
 
 
@@ -204,8 +202,14 @@ def _weekly_anchor_map(trading_days) -> Dict[Tuple[int, int], pd.Timestamp]:
     days share the ISO week with the preceding Friday, so Saturday/Sunday
     resolve to the same anchor.
     """
+    from ops.ops_live_safety import nyse_calendar
+    days = pd.DatetimeIndex(trading_days).tz_localize(None)
     out: Dict[Tuple[int, int], pd.Timestamp] = {}
-    for ts in trading_days:
+    if days.empty:
+        return out
+    start = days.min() - pd.Timedelta(days=days.min().weekday())
+    end = days.max() + pd.Timedelta(days=6-days.max().weekday())
+    for ts in nyse_calendar(start, end).sessions_in_range(start, end):
         iso = ts.isocalendar()
         wk = (iso.year, iso.week)
         prev = out.get(wk)
@@ -226,7 +230,7 @@ def prior_anchor(d: str, dates: list) -> Optional[str]:
             break
         prior = prev_d
     return prior
-def _classify_run_day(t: pd.Timestamp, spy: Optional[pd.Series]) -> Tuple[Optional[str], Optional[str]]:
+def _classify_run_day(t: pd.Timestamp, spy: Optional[pd.Series], *, now=None) -> Tuple[Optional[str], Optional[str]]:
     """Run-day classification -> (refusal_reason_or_None, row_date_or_None).
 
     Returns (reason, None) for a refusal/no-op, or (None, row_date) when a
@@ -244,12 +248,27 @@ def _classify_run_day(t: pd.Timestamp, spy: Optional[pd.Series]) -> Tuple[Option
         return f"not_a_us_trading_day_or_missing_spy:{str(t.date())}", None
     if not weekend and t not in spy.index:
         return f"not_a_us_trading_day_or_missing_spy:{str(t.date())}", None
-    anchor = _weekly_anchor_map(spy.index).get((t.isocalendar().year, t.isocalendar().week))
+    from ops.ops_live_safety import nyse_calendar
+    start = t - pd.Timedelta(days=t.weekday())
+    end = start + pd.Timedelta(days=6)
+    calendar = nyse_calendar(start, end)
+    if not weekend and not calendar.is_session(t):
+        return f"not_a_us_trading_day_or_missing_spy:{str(t.date())}", None
+    sessions = calendar.sessions_in_range(start, end)
+    anchor = sessions[-1] if len(sessions) else None
     if anchor is None:
         return f"not_a_us_trading_day_or_missing_spy:{str(t.date())}", None
     if not weekend and t < anchor:
         return f"not_weekly_anchor_day:{str(t.date())}:{str(anchor.date())}", None
-    return None, str(anchor.date()) if weekend else str(t.date())
+    if (anchor not in spy.index or not pd.notna(spy.loc[anchor])
+            or not math.isfinite(float(spy.loc[anchor])) or float(spy.loc[anchor]) <= 0):
+        return f"not_a_us_trading_day_or_missing_spy:{str(anchor.date())}", None
+    instant = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
+    if instant.tzinfo is None:
+        raise ValueError("weekly classification requires a timezone-aware instant")
+    if instant < calendar.session_close(anchor):
+        return f"weekly_session_not_closed:{str(anchor.date())}", None
+    return None, str(anchor.date())
 
 
 def load_daily() -> pd.DataFrame:
@@ -609,14 +628,6 @@ def record(book: Optional[Dict] = None) -> Dict:
         "cash_usd": round(cash, 6), "spy_close": round(spy_close, 6),
     }])
     df = live_row if df.empty else pd.concat([df, live_row], ignore_index=True)
-    if row_date is not None and pd.Timestamp(row_date).weekday() != 4:
-        # a non-Friday anchor on a weekend run usually means the SPY series is
-        # truncated/stale (the real Friday is missing); holiday weeks are legitimately
-        # Thursday-anchored, so warn instead of refusing
-        print(
-            f"WARNING: recorded anchor {row_date} is not a Friday - the SPY series may be "
-            "truncated/stale; run `python ops.py refresh` if this is unexpected."
-        )
     # per-code market values + weights + avg cost from the live book
     mkt_map: Dict[str, float] = {}
     cost_map: Dict[str, float] = {}

@@ -148,3 +148,47 @@ def select_us_picks(
             if normalize_symbol(k)
         }
     return picks, scores
+
+
+def policy_names(date, close: pd.DataFrame, universe: Optional[pd.DataFrame] = None,
+                 top_n: int = TOP_N_DEFAULT) -> List[str]:
+    """Use the frozen metadata order and >=200 observations known at the signal.
+
+    Metadata is a current-constituent snapshot, not historical PIT membership.
+    Without metadata, the caller explicitly supplies the universe in column order.
+    """
+    if universe is None:
+        ordered = list(close.columns)
+    else:
+        meta = universe.copy()
+        if "Marcap" in meta:
+            meta = meta.sort_values("Marcap", ascending=False, kind="stable")
+        ordered = [normalize_symbol(c) for c in meta["Code"]]
+    ordered = list(dict.fromkeys(ordered))[:top_n]
+    counts = close.loc[:date].notna().sum()
+    return [c for c in ordered if c in counts and counts[c] >= 200]
+
+
+def build_us_target(date, feats, close: pd.DataFrame, volume: pd.DataFrame, regime,
+                    *, universe: Optional[pd.DataFrame] = None,
+                    top_n: int = TOP_N_DEFAULT):
+    """Pure production/research policy: identical eligibility, scores and weights."""
+    from ops.us_hybrid_backtest import merge_sleeve_weights, weights_equal
+
+    names = policy_names(date, close, universe, top_n)
+    c = close.loc[:date, names]
+    v = volume.reindex(index=c.index, columns=names).fillna(0.0)
+    masked = {key: frame.reindex(index=[date], columns=names).copy()
+              for key, frame in feats.items()}
+    # Production ranks its priced eligible universe; recompute those ranks after
+    # filtering so ineligible names cannot influence cross-sectional scores.
+    masked["leader_score"] = sum(weight * masked[key].rank(axis=1, pct=True)
+        for weight, key in ((.45, "mom_12_1"), (.20, "near_high"),
+                            (.15, "mom_63"), (.10, "vol_surge"), (.10, "mom_21")))
+    picks, _ = select_us_picks(date, masked, c, v, regime)
+    name_w = {s: weights_equal(codes) for s, codes in picks.items()}
+    sleeve_w = {s: w if picks[s] else 0.0 for s, w in SLEEVE_WEIGHTS.items()}
+    sleeve_w["cash"] = 1.0 - sum(sleeve_w.values())
+    target = merge_sleeve_weights(sleeve_w, name_w, max_name=MAX_NAME)
+    reg = regime.loc[date] if hasattr(regime, "index") and date in regime.index else regime
+    return picks, target, name_w, str(reg)

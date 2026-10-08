@@ -267,90 +267,7 @@ def run_portfolio(
     weight_mode: str = "equal",
     label: str = "strat",
 ) -> Dict:
-    signal_dates = sorted(picks.keys())
-    if not signal_dates:
-        raise RuntimeError(f"no signals for {label}")
-    exec_map = next_open_map(close.index, open_px)
-    rebal_on: Dict[pd.Timestamp, pd.Timestamp] = {}
-    for sig in signal_dates:
-        ex = exec_map.get(sig)
-        if ex is not None and ex in close.index:
-            rebal_on[ex] = sig
-    if not rebal_on:
-        raise RuntimeError(f"no exec days for {label}")
-
-    all_days = close.index[close.index >= min(rebal_on.keys())]
-    cash = float(SEED)
-    shares: Dict[str, float] = {}
-    prev_w: Dict[str, float] = {}
-    equity_rows = []
-    rets = []
-    hold_log = []
-
-    for d in all_days:
-        port_val = cash
-        for c, sh in shares.items():
-            px = close.at[d, c] if c in close.columns and pd.notna(close.at[d, c]) else np.nan
-            if pd.notna(px):
-                port_val += sh * px
-
-        if d in rebal_on:
-            sig = rebal_on[d]
-            sleeve_picks = picks[sig]
-            smaps = score_by_date.get(sig, {})
-            name_w: Dict[str, Dict[str, float]] = {}
-            for sleeve, codes0 in sleeve_picks.items():
-                codes = []
-                for c in codes0:
-                    if c in open_px.columns and pd.notna(open_px.at[d, c]) and open_px.at[d, c] > 0:
-                        codes.append(c)
-                if weight_mode == "score":
-                    name_w[sleeve] = weights_score(codes, smaps.get(sleeve, {}))
-                else:
-                    name_w[sleeve] = weights_equal(codes)
-            target = merge_sleeve_weights(sleeve_w, name_w, max_name=max_name)
-            to = turnover(prev_w, target)
-            port_val = max(port_val * (1 - to * cost), 0.0)
-            shares = {}
-            invested = 0.0
-            for c, w in target.items():
-                px = open_px.at[d, c]
-                if pd.isna(px) or px <= 0 or w <= 0:
-                    continue
-                sh = (port_val * w) / px
-                shares[c] = sh
-                invested += sh * px
-            cash = port_val - invested
-            prev_w = target
-            hold_log.append({
-                "signal_date": sig.strftime("%Y-%m-%d"),
-                "exec_date": d.strftime("%Y-%m-%d"),
-                "sleeves": {k: v for k, v in sleeve_picks.items()},
-                "n": len(shares),
-                "turnover": round(to, 4),
-                "top": sorted(target.items(), key=lambda x: -x[1])[:8],
-            })
-            port_val = cash
-            for c, sh in shares.items():
-                px = close.at[d, c] if c in close.columns and pd.notna(close.at[d, c]) else np.nan
-                if pd.notna(px):
-                    port_val += sh * px
-
-        equity_rows.append({"date": d, "equity": port_val})
-        if len(equity_rows) >= 2:
-            prev = equity_rows[-2]["equity"]
-            rets.append(port_val / prev - 1 if prev > 0 else 0.0)
-        else:
-            rets.append(0.0)
-
-    eq = pd.DataFrame(equity_rows).set_index("date")["equity"]
-    r = pd.Series(rets, index=eq.index)
-    return {"equity": eq, "returns": r, "holdings": hold_log, "label": label}
-
-
-# ---------------------------------------------------------------------------
-# Diagnostics (stricter)
-# ---------------------------------------------------------------------------
+    raise RuntimeError("Legacy accounting disabled; use research/walk_forward_validation.py")
 
 def split_isoos(eq, rets, b_rets, is_end=IS_END) -> Dict:
     is_mask = eq.index <= pd.Timestamp(is_end)
@@ -364,6 +281,7 @@ def split_isoos(eq, rets, b_rets, is_end=IS_END) -> Dict:
 
 
 def walk_forward(eq, rets, b_rets, n_folds: int = 5) -> List[Dict]:
+    """Legacy segment-stability summary; no training or candidate selection."""
     idx = rets.dropna().index
     if len(idx) < n_folds * 40:
         return []
@@ -605,6 +523,7 @@ def diagnose(label, res, b_rets, b_stats, limited=False):
 
 
 def main(force: bool = False):
+    raise RuntimeError("Legacy accounting disabled; use research/walk_forward_validation.py")
     OUT.mkdir(parents=True, exist_ok=True)
     CHART.mkdir(parents=True, exist_ok=True)
 

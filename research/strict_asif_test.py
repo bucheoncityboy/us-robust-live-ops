@@ -107,105 +107,7 @@ def simulate(
       next_open     -> policy: fill at next trading day open
       signal_close  -> lookahead sensitivity: fill at signal-day close
     """
-    sleeve_weights = dict(sleeve_weights or SLEEVE_WEIGHTS)
-    exec_map = next_open_map(close.index, open_px)
-    sig_to_exec: Dict[pd.Timestamp, pd.Timestamp] = {}
-    for sig in sorted(picks_by_sig):
-        if exec_rule == "next_open":
-            ex = exec_map.get(sig)
-            if ex is not None and ex in close.index:
-                sig_to_exec[sig] = ex
-        else:
-            if sig in close.index:
-                sig_to_exec[sig] = sig
-    if not sig_to_exec:
-        raise RuntimeError("no executable signal dates")
-
-    rebal_on = {ex: sig for sig, ex in sig_to_exec.items()}
-    all_days = close.index[close.index >= min(rebal_on.keys())]
-    cash = float(SEED)
-    shares: Dict[str, float] = {}
-    prev_w: Dict[str, float] = {}
-    equity_rows = []
-    rets = []
-    logs = []
-    for d in all_days:
-        port_val = cash
-        for c, sh in shares.items():
-            px = close.at[d, c] if c in close.columns else np.nan
-            if pd.notna(px):
-                port_val += sh * px
-
-        if d in rebal_on:
-            sig = rebal_on[d]
-            picks = picks_by_sig[sig]
-            name_w: Dict[str, Dict[str, float]] = {}
-            dropped = 0
-            for s in SLEEVES:
-                codes = []
-                for c in picks.get(s, []):
-                    if exec_rule == "next_open":
-                        px = open_px.at[d, c] if c in open_px.columns else np.nan
-                    else:
-                        px = close.at[d, c] if c in close.columns else np.nan
-                    if pd.notna(px) and px > 0:
-                        codes.append(c)
-                    else:
-                        dropped += 1
-                name_w[s] = weights_equal(codes)
-            sw = dict(sleeve_weights)
-            cash_w = 0.0
-            for s in SLEEVES:
-                if not name_w.get(s):
-                    cash_w += sw.pop(s, 0.0)
-            if cash_w > 0:
-                sw["cash"] = sw.get("cash", 0.0) + cash_w
-            target = merge_sleeve_weights(sw, name_w, max_name=MAX_NAME)
-            to = turnover(prev_w, target)
-            port_val = max(port_val * (1 - to * cost), 0.0)
-
-            shares = {}
-            invested = 0.0
-            for c, w in target.items():
-                px = open_px.at[d, c] if exec_rule == "next_open" else close.at[d, c]
-                if pd.isna(px) or px <= 0 or w <= 0:
-                    continue
-                sh = (port_val * w) / px
-                shares[c] = sh
-                invested += sh * px
-            cash = port_val - invested
-            prev_w = target
-            logs.append(
-                {
-                    "signal_date": sig.strftime("%Y-%m-%d"),
-                    "exec_date": d.strftime("%Y-%m-%d"),
-                    "n_leader": len(picks.get("leader", [])),
-                    "n_mom63": len(picks.get("mom63", [])),
-                    "n_lowvol": len(picks.get("lowvol", [])),
-                    "n_names": len(shares),
-                    "weight_sum": round(float(sum(target.values())), 6),
-                    "turnover": round(float(to), 4),
-                    "cost_paid_bps": round(float(to * cost * 1e4), 2),
-                    "exec_drops": dropped,
-                    "top3": [f"{c}:{w:.3f}" for c, w in sorted(target.items(), key=lambda x: -x[1])[:3]],
-                }
-            )
-            port_val = cash
-            for c, sh in shares.items():
-                px = close.at[d, c] if c in close.columns else np.nan
-                if pd.notna(px):
-                    port_val += sh * px
-
-        equity_rows.append({"date": d, "equity": port_val})
-        if len(equity_rows) >= 2:
-            prev = equity_rows[-2]["equity"]
-            rets.append(port_val / prev - 1 if prev > 0 else 0.0)
-        else:
-            rets.append(0.0)
-
-    eq = pd.DataFrame(equity_rows).set_index("date")["equity"]
-    r = pd.Series(rets, index=eq.index)
-    return {"equity": eq, "returns": r, "logs": logs}
+    raise RuntimeError("Legacy accounting disabled; use research/walk_forward_validation.py")
 
 
 def monthly_returns(eq: pd.Series) -> pd.Series:
@@ -270,6 +172,7 @@ def validate_against_live(picks_by_sig, w_by_sig, sig) -> Dict:
 
 
 def main() -> None:
+    raise RuntimeError("Legacy accounting disabled; use research/walk_forward_validation.py")
     OUT.mkdir(parents=True, exist_ok=True)
     print("== 1) production data load (cache only) ==")
     close, volume, index_close, regime, feats, frgn_feats, val, meta, name_map, sector_map, _frgn = load_market()

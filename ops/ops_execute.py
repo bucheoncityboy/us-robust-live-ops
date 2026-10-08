@@ -206,7 +206,7 @@ def run_execute(
     effective_risk = risk_mode or "NORMAL"
 
     summary["phase"] = "rebuild"
-    from ops.ops_monthly_run import rebuild_rebalance_ticket, load_positions
+    from ops.ops_monthly_run import rebuild_rebalance_ticket
     try:
         ticket = rebuild_rebalance_ticket(
             run_dir, positions=positions, capital_usd=capital_usd, risk_mode=effective_risk,
@@ -214,7 +214,7 @@ def run_execute(
     except Exception as exc:
         summary["error"] = f"rebuild_fail:{type(exc).__name__}:{exc}"
         return 2, summary
-    book = getattr(load_positions, "last_toss_book", None)
+    book = ticket.get("book")
     summary["ticket"] = {k: ticket.get(k) for k in ("n_buy", "n_sell", "capital_usd", "cash_usd", "risk_mode")}
 
     xpath = None
@@ -267,6 +267,7 @@ def run_execute(
     gate_a = evaluate_gates(
         sendable, health, phase="A", cash_usd=cash0,
         confirm_high_value=confirm_high_value,
+        orders=csv_df,
     )
     summary["gate_a"] = gate_result_dict(gate_a)
     if not gate_a.ok:
@@ -429,6 +430,7 @@ def run_execute(
         gate_b = evaluate_gates(
             sendable, health, phase="B", cash_usd=cash0,
             post_sell_cash_usd=cash1, confirm_high_value=confirm_high_value,
+            orders=csv_df,
         )
         summary["gate_b"] = gate_result_dict(gate_b)
         if not gate_b.ok:

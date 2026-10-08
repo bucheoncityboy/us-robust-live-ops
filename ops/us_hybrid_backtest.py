@@ -18,8 +18,11 @@ US adaptations:
 from __future__ import annotations
 
 import json
+import hashlib
 import math
+import shutil
 import time
+import uuid
 import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -32,7 +35,7 @@ warnings.filterwarnings("ignore")
 try:
     import yfinance as yf
 except ImportError as e:
-    raise SystemExit("yfinance required: pip install yfinance") from e
+    yf = None  # Offline feature/accounting paths do not require download clients.
 
 try:
     import FinanceDataReader as fdr
@@ -51,6 +54,100 @@ CACHE_OPEN = DATA / "us_open_panel.parquet"
 CACHE_INDEX = DATA / "spy.parquet"
 CACHE_FUND = DATA / "us_fundamentals.parquet"
 CACHE_VAL = DATA / "us_valuation_panel.parquet"
+
+SNAPSHOT_FILES = ("us_universe_meta.parquet", "us_prices_panel.parquet",
+                  "us_open_panel.parquet", "us_volume_panel.parquet", "spy.parquet")
+
+
+def market_data_dir(data_dir: Path) -> Path:
+    """Resolve the atomic pointer once; every consumer pins one immutable version."""
+    base = Path(data_dir).resolve()
+    pointer = base / "current_snapshot.json"
+    if not pointer.exists():
+        return base
+    payload = json.loads(pointer.read_text(encoding="utf-8"))
+    target = (base / payload["snapshot"]).resolve()
+    if target.parent != base / "snapshots" or not all((target / n).is_file() for n in SNAPSHOT_FILES):
+        raise ValueError("Invalid/incomplete market snapshot pointer")
+    return target
+
+
+def market_cache_path(path: Path) -> Path:
+    return market_data_dir(Path(path).parent) / Path(path).name
+
+
+def _require_staged_write(path: Path, data_dir: Optional[Path]) -> None:
+    parent = Path(path).parent.resolve()
+    published = parent.parent == DATA.resolve() / "snapshots" and (parent / "manifest.json").exists()
+    if published or (data_dir is None and parent != DATA.resolve()):
+        raise RuntimeError("Published market snapshots are immutable; use ops.py refresh")
+
+
+def refresh_market_snapshot(*, force: bool = True, with_fundamentals: bool = False,
+                            now=None):
+    """Stage the whole bundle, validate it, then atomically publish one pointer.
+
+    A download, validation or publication failure leaves the prior pointer and
+    all its files intact. Unpublished versions are retained for diagnosis.
+    """
+    from ops.ops_live_safety import atomic_write_json, nyse_calendar, validate_session_coverage
+    base = DATA.resolve()
+    source = market_data_dir(base)
+    stage = base / "snapshots" / uuid.uuid4().hex
+    stage.mkdir(parents=True)
+    for name in (*SNAPSHOT_FILES, CACHE_FUND.name, CACHE_VAL.name):
+        old = source / name
+        if old.is_file():
+            shutil.copy2(old, stage / name)
+    meta = build_universe(top_n=TOP_N, force_refresh=force, data_dir=stage)
+    codes = meta["Code"].astype(str).tolist()
+    close, opens, volume = load_prices(codes, force=force, data_dir=stage)
+    spy = load_index(force=force, data_dir=stage)
+    instant = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
+    if instant.tzinfo is None:
+        raise ValueError("Refresh requires a timezone-aware instant")
+    today = instant.tz_convert("America/New_York").normalize().tz_localize(None)
+    calendar = nyse_calendar(today - pd.Timedelta(days=10), today)
+    completed = [d for d in calendar.sessions_in_range(today-pd.Timedelta(days=10), today)
+                 if calendar.session_close(d) <= instant]
+    last = completed[-1]
+    close, opens, volume, spy = [f.loc[:last].copy() for f in (close, opens, volume, spy)]
+    required = min(len(codes), max(80, int(len(codes)*.80)))
+    if close.empty or close.shape[1] < required:
+        raise ValueError("Snapshot has insufficient priced-universe coverage")
+    for label, frame in (("close", close), ("open", opens), ("volume", volume), ("SPY", spy)):
+        validate_session_coverage(frame.index, close.index[0], last, label)
+        if not close.index.equals(frame.index):
+            raise ValueError(f"Snapshot date axes differ: {label}")
+    if (not close.columns.equals(opens.columns) or not close.columns.equals(volume.columns)
+            or close.columns.has_duplicates or meta["Code"].duplicated().any()
+            or not set(close.columns).issubset(codes)):
+        raise ValueError("Snapshot symbol axes differ")
+    if (not np.isfinite(spy).all() or (spy <= 0).any()
+            or any((np.isfinite(f.iloc[-1]) & (f.iloc[-1] > 0)).sum() < required
+                   for f in (close, opens, volume))):
+        raise ValueError("Snapshot has invalid final-session coverage")
+    meta = meta[meta["Code"].isin(close.columns)].copy()
+    for frame, name in ((meta, SNAPSHOT_FILES[0]), (close, SNAPSHOT_FILES[1]),
+                        (opens, SNAPSHOT_FILES[2]), (volume, SNAPSHOT_FILES[3]),
+                        (spy.to_frame("Close"), SNAPSHOT_FILES[4])):
+        frame.to_parquet(stage / name)
+    val = pd.DataFrame()
+    try:
+        fund_path = stage / CACHE_FUND.name
+        fund = (download_fundamentals(codes, force=force, data_dir=stage) if with_fundamentals
+                else pd.read_parquet(fund_path) if fund_path.exists() else pd.DataFrame())
+        val = build_valuation_panel(close, volume, build_ttm(fund) if not fund.empty else fund,
+                                    force=True, data_dir=stage)
+    except Exception as exc:
+        print(f"valuation rebuild skipped in staged snapshot: {exc}")
+    manifest = {"snapshot": stage.relative_to(base).as_posix(),
+                "last_session": str(last.date()), "n_codes": close.shape[1],
+                "sha256": {n: hashlib.sha256((stage / n).read_bytes()).hexdigest()
+                           for n in SNAPSHOT_FILES}}
+    atomic_write_json(stage / "manifest.json", manifest)
+    atomic_write_json(base / "current_snapshot.json", manifest)
+    return meta, close, opens, volume, spy, val
 
 SEED = 1_000_000.0  # USD notional
 COST_BASE = 0.0010  # 10bp round-trip
@@ -246,18 +343,20 @@ def turnover(prev: Dict[str, float], new: Dict[str, float]) -> float:
 # Data layer
 # ---------------------------------------------------------------------------
 
-def build_universe(top_n: int = TOP_N, force_refresh: bool = False) -> pd.DataFrame:
+def build_universe(top_n: int = TOP_N, force_refresh: bool = False, *, data_dir: Optional[Path] = None) -> pd.DataFrame:
     DATA.mkdir(parents=True, exist_ok=True)
-    if CACHE_META.exists() and not force_refresh:
-        meta = pd.read_parquet(CACHE_META)
+    meta_path = Path(data_dir) / CACHE_META.name if data_dir is not None else market_cache_path(CACHE_META)
+    if meta_path.exists() and not force_refresh:
+        meta = pd.read_parquet(meta_path)
         if len(meta) < top_n:
             print(f"[meta] WARN cached shortfall n={len(meta)}/{top_n}")
         else:
             print(f"[meta] cached n={len(meta)}")
         return meta.head(top_n).reset_index(drop=True)
 
-    if fdr is None:
-        raise SystemExit("FinanceDataReader required for S&P500 listing")
+    if fdr is None or yf is None:
+        raise RuntimeError("Refresh requires finance-datareader and yfinance; install requirements.txt")
+    _require_staged_write(meta_path, data_dir)
     lst = fdr.StockListing("S&P500").copy()
     lst = lst.rename(columns={"Symbol": "Code"})
     lst["Code"] = lst["Code"].astype(str).str.replace(".", "-", regex=False)
@@ -297,9 +396,9 @@ def build_universe(top_n: int = TOP_N, force_refresh: bool = False) -> pd.DataFr
     lst = lst.sort_values("DollarVolProxy", ascending=False).head(top_n).reset_index(drop=True)
     if len(lst) < min(top_n, 100):
         raise RuntimeError(f"universe refresh too small: {len(lst)}/{top_n}; existing cache preserved")
-    tmp_meta = CACHE_META.with_suffix(CACHE_META.suffix + ".tmp")
+    tmp_meta = meta_path.with_suffix(meta_path.suffix + ".tmp")
     lst.to_parquet(tmp_meta, index=False)
-    tmp_meta.replace(CACHE_META)
+    tmp_meta.replace(meta_path)
     print(f"[meta] saved n={len(lst)}")
     return lst
 
@@ -314,6 +413,8 @@ def _download_ohlcv(codes: List[str], start: str, end: str) -> Tuple[pd.DataFram
     Handle all three; never crash the refresh on a single bad ticker.
     """
     print(f"[prices] downloading {len(codes)} tickers {start}~{end}")
+    if yf is None:
+        raise RuntimeError("Price download requires yfinance; install requirements.txt")
     empty = (
         pd.DataFrame(),
         pd.DataFrame(),
@@ -415,16 +516,19 @@ def _download_ohlcv(codes: List[str], start: str, end: str) -> Tuple[pd.DataFram
     return close, open_, volume
 
 
-def load_prices(codes: List[str], force: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def load_prices(codes: List[str], force: bool = False, *, data_dir: Optional[Path] = None) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Load OHLCV panels; on cache-hit still backfill any missing requested codes."""
     DATA.mkdir(parents=True, exist_ok=True)
     end = resolve_end(END)
     codes = [str(c) for c in codes]
-    vol_path = DATA / "us_volume_panel.parquet"
+    snapshot = Path(data_dir) if data_dir is not None else market_data_dir(DATA)
+    prices_path = snapshot / CACHE_PRICES.name
+    open_path = snapshot / CACHE_OPEN.name
+    vol_path = snapshot / "us_volume_panel.parquet"
 
-    if CACHE_PRICES.exists() and CACHE_OPEN.exists() and not force:
-        close = pd.read_parquet(CACHE_PRICES)
-        open_ = pd.read_parquet(CACHE_OPEN)
+    if prices_path.exists() and open_path.exists() and not force:
+        close = pd.read_parquet(prices_path)
+        open_ = pd.read_parquet(open_path)
         if vol_path.exists():
             volume = pd.read_parquet(vol_path)
         else:
@@ -437,14 +541,15 @@ def load_prices(codes: List[str], force: bool = False) -> Tuple[pd.DataFrame, pd
         stale = cache_is_stale(close.index)
         if len(use) >= min(80, max(1, len(codes) // 2)) and not stale:
             if missing:
+                _require_staged_write(prices_path, data_dir)
                 print(f"[prices] cache hit but missing {len(missing)} codes -> backfill {missing[:8]}")
                 add_c, add_o, add_v = _download_ohlcv(missing, START, end)
                 if add_c is not None and not add_c.empty:
                     close = close.join(add_c, how="outer")
                     open_ = open_.join(add_o, how="outer")
                     volume = volume.join(add_v, how="outer")
-                    close.to_parquet(CACHE_PRICES)
-                    open_.to_parquet(CACHE_OPEN)
+                    close.to_parquet(prices_path)
+                    open_.to_parquet(open_path)
                     volume.to_parquet(vol_path)
                     use = [c for c in codes if c in close.columns]
                     still = [c for c in codes if c not in close.columns]
@@ -456,29 +561,34 @@ def load_prices(codes: List[str], force: bool = False) -> Tuple[pd.DataFrame, pd
         if len(use) >= min(80, max(1, len(codes) // 2)):
             print(f"[prices] cache stale max={pd.Timestamp(close.index.max()).date()} -> refresh to {end}")
 
+    _require_staged_write(prices_path, data_dir)
     close, open_, volume = _download_ohlcv(codes, START, end)
     min_cols = min(len(codes), max(80, int(len(codes) * 0.80)))
     if close is None or close.empty or close.shape[1] < min_cols:
         raise RuntimeError(
             f"price refresh validation failed: cols={0 if close is None else close.shape[1]} required={min_cols}; existing cache preserved"
         )
-    for frame, path in ((close, CACHE_PRICES), (open_, CACHE_OPEN), (volume, vol_path)):
+    for frame, path in ((close, prices_path), (open_, open_path), (volume, vol_path)):
         tmp = path.with_suffix(path.suffix + ".tmp")
         frame.to_parquet(tmp)
         tmp.replace(path)
     return close, open_, volume
 
-def load_index(force: bool = False) -> pd.Series:
+def load_index(force: bool = False, *, data_dir: Optional[Path] = None) -> pd.Series:
     DATA.mkdir(parents=True, exist_ok=True)
     end = resolve_end(END)
-    if CACHE_INDEX.exists() and not force:
-        df = pd.read_parquet(CACHE_INDEX)
+    index_path = Path(data_dir) / CACHE_INDEX.name if data_dir is not None else market_cache_path(CACHE_INDEX)
+    if index_path.exists() and not force:
+        df = pd.read_parquet(index_path)
         s = df["Close"] if "Close" in df.columns else df.iloc[:, 0]
         s.index = pd.to_datetime(s.index).tz_localize(None)
         s = s.astype(float).sort_index()
         if not cache_is_stale(s.index):
             return s
         print(f"[index] cache stale max={pd.Timestamp(s.index.max()).date()} -> refresh to {end}")
+    if yf is None:
+        raise RuntimeError("SPY download requires yfinance; install requirements.txt")
+    _require_staged_write(index_path, data_dir)
     raw = yf.download("SPY", start=START, end=end, progress=False, auto_adjust=True)
     raw.index = pd.to_datetime(raw.index).tz_localize(None)
     if isinstance(raw.columns, pd.MultiIndex):
@@ -486,9 +596,9 @@ def load_index(force: bool = False) -> pd.Series:
     if raw is None or raw.empty or "Close" not in raw.columns:
         raise RuntimeError("SPY refresh returned no usable Close; existing cache preserved")
     out = raw[["Close"]].copy()
-    tmp = CACHE_INDEX.with_suffix(CACHE_INDEX.suffix + ".tmp")
+    tmp = index_path.with_suffix(index_path.suffix + ".tmp")
     out.to_parquet(tmp)
-    tmp.replace(CACHE_INDEX)
+    tmp.replace(index_path)
     return out["Close"].astype(float)
 
 
@@ -580,16 +690,19 @@ def fetch_ticker_fundamentals(code: str) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
-def download_fundamentals(codes: List[str], force: bool = False, limit: Optional[int] = None) -> pd.DataFrame:
+def download_fundamentals(codes: List[str], force: bool = False, limit: Optional[int] = None, *, data_dir: Optional[Path] = None) -> pd.DataFrame:
     DATA.mkdir(parents=True, exist_ok=True)
+    fund_path = Path(data_dir) / CACHE_FUND.name if data_dir is not None else market_cache_path(CACHE_FUND)
     existing = pd.DataFrame()
     have = set()
-    if CACHE_FUND.exists() and not force:
-        existing = pd.read_parquet(CACHE_FUND)
+    if fund_path.exists() and not force:
+        existing = pd.read_parquet(fund_path)
         if not existing.empty:
             have = set(existing["code"].astype(str).unique())
     target = codes if limit is None else codes[:limit]
     missing = [c for c in target if c not in have]
+    if missing:
+        _require_staged_write(fund_path, data_dir)
     print(f"[fund] cached={len(have)} missing={len(missing)}")
     frames = [existing] if not existing.empty else []
     for i, code in enumerate(missing, 1):
@@ -601,7 +714,7 @@ def download_fundamentals(codes: List[str], force: bool = False, limit: Optional
                 print(f"  fund {i}/{len(missing)} {code} rows={0 if df is None else len(df)}")
                 if frames:
                     tmp = pd.concat(frames, ignore_index=True)
-                    tmp.to_parquet(CACHE_FUND, index=False)
+                    tmp.to_parquet(fund_path, index=False)
             time.sleep(0.12)
         except Exception as e:
             print(f"  fund fail {code}: {e}")
@@ -612,7 +725,7 @@ def download_fundamentals(codes: List[str], force: bool = False, limit: Optional
     out["code"] = out["code"].astype(str)
     out["period_end"] = pd.to_datetime(out["period_end"])
     out = out.drop_duplicates(["code", "period_end", "freq"], keep="last")
-    out.to_parquet(CACHE_FUND, index=False)
+    out.to_parquet(fund_path, index=False)
     return out
 
 
@@ -646,14 +759,16 @@ def build_ttm(fund: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_valuation_panel(close: pd.DataFrame, volume: pd.DataFrame,
-                          fund_ttm: pd.DataFrame, force: bool = False) -> pd.DataFrame:
-    if CACHE_VAL.exists() and not force:
-        cached = pd.read_parquet(CACHE_VAL)
+                          fund_ttm: pd.DataFrame, force: bool = False, *, data_dir: Optional[Path] = None) -> pd.DataFrame:
+    val_path = Path(data_dir) / CACHE_VAL.name if data_dir is not None else market_cache_path(CACHE_VAL)
+    if val_path.exists() and not force:
+        cached = pd.read_parquet(val_path)
         if not cached.empty and pd.to_datetime(cached["date"]).max() >= pd.Timestamp("2024-01-01"):
             print(f"[val] cached rows={len(cached)}")
             return cached
     if fund_ttm is None or fund_ttm.empty:
         return pd.DataFrame()
+    _require_staged_write(val_path, data_dir)
 
     fund_ttm = fund_ttm.copy()
     fund_ttm["available_from"] = pd.to_datetime(fund_ttm["period_end"]) + pd.Timedelta(days=FUND_LAG_DAYS)
@@ -715,7 +830,7 @@ def build_valuation_panel(close: pd.DataFrame, volume: pd.DataFrame,
 
     val = val.groupby("date", group_keys=False).apply(add_ranks)
     val["date"] = pd.to_datetime(val["date"])
-    val.to_parquet(CACHE_VAL, index=False)
+    val.to_parquet(val_path, index=False)
     print(f"[val] rows={len(val)} months={val['date'].nunique()} codes={val['code'].nunique()}")
     return val
 
@@ -869,102 +984,7 @@ def run_strict(
     label: str = "strat",
 ) -> Dict:
     """Signal at month-end close → execute at next open with SCORE weights + name cap."""
-    signal_dates = sorted(picks_by_date.keys())
-    if not signal_dates:
-        raise RuntimeError("no signal dates")
-    exec_map = next_open_map(close.index, open_px)
-    # map exec_day -> signal_day
-    rebal_on: Dict[pd.Timestamp, pd.Timestamp] = {}
-    for sig in signal_dates:
-        ex = exec_map.get(sig)
-        if ex is not None and ex in close.index:
-            rebal_on[ex] = sig
-
-    all_days = close.index[close.index >= min(rebal_on.keys())]
-    cash = float(SEED)
-    shares: Dict[str, float] = {}
-    prev_w: Dict[str, float] = {}
-    equity_rows = []
-    rets = []
-    hold_log = []
-    weights_hist = []
-
-    for d in all_days:
-        # mark-to-market on close for equity curve
-        port_val = cash
-        for c, sh in shares.items():
-            px = close.at[d, c] if c in close.columns and pd.notna(close.at[d, c]) else np.nan
-            if pd.notna(px):
-                port_val += sh * px
-
-        if d in rebal_on:
-            sig = rebal_on[d]
-            picks = picks_by_date[sig]
-            score_maps = {
-                "leader": feats["leader_score"].loc[sig].to_dict() if sig in feats["leader_score"].index else {},
-                "value_mom": {},
-                "divergence": feats["bull_div"].loc[sig].to_dict() if sig in feats["bull_div"].index else {},
-            }
-            if not val.empty:
-                snap = val[val["date"] == sig]
-                if not snap.empty and "value_score" in snap.columns:
-                    score_maps["value_mom"] = dict(zip(snap["code"], snap["value_score"]))
-
-            name_w: Dict[str, Dict[str, float]] = {}
-            for sleeve in ["leader", "value_mom", "divergence"]:
-                codes = []
-                for c in picks.get(sleeve, []):
-                    if c in open_px.columns and pd.notna(open_px.at[d, c]) and open_px.at[d, c] > 0:
-                        codes.append(c)
-                if weight_mode == "equal":
-                    name_w[sleeve] = weights_equal(codes)
-                else:
-                    name_w[sleeve] = weights_score(codes, score_maps.get(sleeve, {}))
-
-            target = merge_sleeve_weights(sleeve_w, name_w, max_name=max_name)
-            to = turnover(prev_w, target)
-            port_val = max(port_val * (1 - to * cost), 0.0)
-
-            shares = {}
-            invested = 0.0
-            for c, w in target.items():
-                px = open_px.at[d, c]
-                if pd.isna(px) or px <= 0 or w <= 0:
-                    continue
-                sh = (port_val * w) / px
-                shares[c] = sh
-                invested += sh * px
-            cash = port_val - invested
-            prev_w = target
-            hold_log.append({
-                "signal_date": sig.strftime("%Y-%m-%d"),
-                "exec_date": d.strftime("%Y-%m-%d"),
-                "leader": picks.get("leader", []),
-                "value_mom": picks.get("value_mom", []),
-                "divergence": picks.get("divergence", []),
-                "n": len(shares),
-                "turnover": round(to, 4),
-                "top": sorted(target.items(), key=lambda x: -x[1])[:8],
-            })
-            weights_hist.append({"date": d.strftime("%Y-%m-%d"), "n": len(shares), "turnover": to})
-
-            # re-mark after open fills using close for EOD
-            port_val = cash
-            for c, sh in shares.items():
-                px = close.at[d, c] if c in close.columns and pd.notna(close.at[d, c]) else np.nan
-                if pd.notna(px):
-                    port_val += sh * px
-
-        equity_rows.append({"date": d, "equity": port_val})
-        if len(equity_rows) >= 2:
-            prev = equity_rows[-2]["equity"]
-            rets.append(port_val / prev - 1 if prev > 0 else 0.0)
-        else:
-            rets.append(0.0)
-
-    eq = pd.DataFrame(equity_rows).set_index("date")["equity"]
-    r = pd.Series(rets, index=eq.index)
-    return {"equity": eq, "returns": r, "holdings": hold_log, "weights_hist": weights_hist, "label": label}
+    raise RuntimeError("Legacy accounting disabled; use research/walk_forward_validation.py")
 
 
 def run_benchmark(index_close: pd.Series, ref_index: pd.DatetimeIndex, cost: float = 0.0) -> Tuple[pd.Series, pd.Series]:
@@ -991,6 +1011,7 @@ def split_isoos(eq: pd.Series, rets: pd.Series, b_rets: pd.Series, is_end: str =
 
 
 def walk_forward(eq: pd.Series, rets: pd.Series, b_rets: pd.Series, n_folds: int = 5) -> List[Dict]:
+    """Legacy segment-stability summary; no training or candidate selection."""
     idx = rets.dropna().index
     if len(idx) < 300:
         return []
@@ -1115,6 +1136,7 @@ def evaluate_gates(stats: Dict, isoos: Dict, wf: List[Dict], boot: Dict, b_stats
 # ---------------------------------------------------------------------------
 
 def main(force: bool = False, top_n: int = TOP_N, fund_limit: Optional[int] = None):
+    raise RuntimeError("Legacy accounting disabled; use research/walk_forward_validation.py")
     OUT.mkdir(parents=True, exist_ok=True)
     CHART.mkdir(parents=True, exist_ok=True)
 

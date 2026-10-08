@@ -128,6 +128,7 @@ def pick_recommended(rows: List[Dict]) -> Dict:
 
 
 def main(force: bool = False):
+    raise RuntimeError("Legacy accounting disabled; use research/walk_forward_validation.py")
     OUT.mkdir(parents=True, exist_ok=True)
     CHART.mkdir(parents=True, exist_ok=True)
 

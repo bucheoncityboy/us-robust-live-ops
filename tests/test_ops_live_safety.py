@@ -241,11 +241,10 @@ def test_execute_connect_failure_is_structured_zero_order_posts(tmp_path, monkey
         "account_seq": "1", "account_no_tail": "1234", "account_type": "BROKERAGE",
         "cash_buying_power_usd": 1000.0, "cash_usd": 1000.0, "us_holdings": [],
     }
-    ops_monthly_run.load_positions.last_toss_book = book
     monkeypatch.setenv("TOSS_ACCOUNT_SEQ", "1")
     monkeypatch.setattr(ops_execute, "validate_execute_package", lambda *a, **k: {"ok": True, "package_id": "pkg", "signal_date": "2026-06-30"})
     monkeypatch.setattr(ops_monthly_run, "rebuild_rebalance_ticket", lambda *a, **k: {
-        "n_buy": 1, "n_sell": 0, "capital_usd": 1000.0, "cash_usd": 1000.0, "risk_mode": "NORMAL",
+        "n_buy": 1, "n_sell": 0, "capital_usd": 1000.0, "cash_usd": 1000.0, "risk_mode": "NORMAL", "book": book,
     })
     monkeypatch.setattr(ops_execute, "LIVE_ORDERS_ENABLED", True)
     monkeypatch.setattr(ops_execute, "research_block_reason", lambda: None)
@@ -406,9 +405,9 @@ def test_weekly_anchor_friday_or_holiday_adj():
     assert _is_weekly_anchor(pd.Timestamp("2026-08-07"), m)
     assert not _is_weekly_anchor(pd.Timestamp("2026-08-06"), m)
     # holiday week without a Friday trading day: anchor rolls back to Thursday
-    idx2 = pd.to_datetime(["2026-08-10", "2026-08-11", "2026-08-12", "2026-08-13"])
+    idx2 = pd.to_datetime(["2026-03-30", "2026-03-31", "2026-04-01", "2026-04-02"])
     m2 = _weekly_anchor_map(idx2)
-    assert list(m2.values()) == [pd.Timestamp("2026-08-13")]
+    assert list(m2.values()) == [pd.Timestamp("2026-04-02")]
 
 
 def test_weekly_anchor_mid_week_refusal():
@@ -873,13 +872,12 @@ def test_execute_order_outcomes_rebuild_post_trade_excel(tmp_path, monkeypatch, 
         "account_seq": "1", "account_no_tail": "1234", "account_type": "BROKERAGE",
         "cash_buying_power_usd": 1000.0, "cash_usd": 1000.0, "us_holdings": [],
     }
-    ops_monthly_run.load_positions.last_toss_book = book
     monkeypatch.setenv("TOSS_ACCOUNT_SEQ", "1")
     monkeypatch.setattr(ops_execute, "validate_execute_package", lambda *a, **k: {
         "ok": True, "package_id": f"pkg-{terminal}", "signal_date": "2026-06-30"
     })
     monkeypatch.setattr(ops_monthly_run, "rebuild_rebalance_ticket", lambda *a, **k: {
-        "n_buy": 1, "n_sell": 0, "capital_usd": 1000.0, "cash_usd": 1000.0, "risk_mode": "NORMAL",
+        "n_buy": 1, "n_sell": 0, "capital_usd": 1000.0, "cash_usd": 1000.0, "risk_mode": "NORMAL", "book": book,
     })
     monkeypatch.setattr(ops_execute, "LIVE_ORDERS_ENABLED", True)
     monkeypatch.setattr(ops_execute, "research_block_reason", lambda: None)
@@ -906,3 +904,250 @@ def test_execute_order_outcomes_rebuild_post_trade_excel(tmp_path, monkeypatch, 
     code, _ = ops_execute.run_execute(run, positions="toss", no_xlsx=False, risk_mode="NORMAL")
     assert code == expected_code
     refresh.assert_called_once()
+
+
+def test_missing_individual_open_uses_signal_close():
+    import numpy as np
+    from ops.ops_monthly_run import attach_share_sizes, validate_share_sizing
+    from ops.ops_execute_gates import materialize_send_list, evaluate_gates
+    dates = pd.to_datetime(["2026-06-30", "2026-07-01"])
+    close = pd.DataFrame({"AAPL": [100., 500.], "MSFT": [200., 200.]}, index=dates)
+    opens = pd.DataFrame({"AAPL": [100., np.nan], "MSFT": [200., 200.]}, index=dates)
+    orders = [{"code": c, "side": "BUY", "target_w": .1, "current_w": 0.} for c in close]
+    attach_share_sizes(orders, close, 10000., signal_date=dates[0], open_px=opens)
+    assert orders[0]["est_px"] == 100. and orders[0]["px_source"] == "yfinance_signal_close"
+    assert orders[0]["qty"] == 10. and orders[1]["qty"] == 5.
+    sizing = validate_share_sizing(orders, 10000., 10000.)
+    assert not sizing["errors"]
+    sendable = materialize_send_list(pd.DataFrame(orders))
+    assert len(sendable) == 2
+    assert evaluate_gates(sendable, {"status": "OK", "capital_usd": 10000., "sizing": sizing}).ok
+
+
+@pytest.mark.parametrize("phase", ["A", "B"])
+def test_missing_order_blocks_the_whole_basket_even_without_sizing_errors(phase):
+    import numpy as np
+    from ops.ops_execute_gates import materialize_send_list, evaluate_gates
+    orders = pd.DataFrame([
+        {"code": "AAPL", "side": "BUY", "qty": np.nan, "est_px": np.nan},
+        {"code": "MSFT", "side": "BUY", "qty": 5., "est_px": 200.},
+    ])
+    sendable = materialize_send_list(orders)
+    assert len(sendable) == 1
+    health = {"status": "WARN", "capital_usd": 10000., "sizing": {"cash_usd": 10000.}}
+    gate = evaluate_gates(sendable, health, phase=phase, post_sell_cash_usd=10000., orders=orders)
+    assert not gate.ok and "order_basket_incomplete_or_changed" in gate.reasons
+    health["sizing"]["errors"] = ["missing_prices"]
+    gate = evaluate_gates(sendable, health, phase=phase, post_sell_cash_usd=10000.)
+    assert not gate.ok and "sizing:missing_prices" in gate.reasons
+
+
+def test_rebuild_missing_all_prices_blocks_then_can_recover(tmp_path, monkeypatch):
+    import numpy as np
+    import ops.us_hybrid_backtest as us
+    from ops.ops_monthly_run import rebuild_rebalance_ticket
+    run = make_package(tmp_path / "runs")
+    data = tmp_path / "data"
+    data.mkdir()
+    prices = pd.DataFrame({"AAPL": [np.nan]}, index=pd.to_datetime(["2026-06-30"]))
+    path = data / "us_prices_panel.parquet"
+    prices.to_parquet(path)
+    monkeypatch.setattr(us, "DATA", data)
+    old_health = json.loads((run / "health.json").read_text())
+    old_health["toss"] = {"cash_usd": 10000., "total_usd": 10000.}
+    (run / "health.json").write_text(json.dumps(old_health))
+    ticket = rebuild_rebalance_ticket(run, positions="none", capital_usd=1000.)
+    health = json.loads((run / "health.json").read_text())
+    assert ticket["book"] is None and health["status"] == "BLOCK"
+    assert "toss" not in health
+    assert "missing_prices" in health["sizing"]["errors"]
+    prices.iloc[0, 0] = 100.
+    prices.to_parquet(path)
+    rebuild_rebalance_ticket(run, positions="none", capital_usd=1000.)
+    health = json.loads((run / "health.json").read_text())
+    assert health["status"] == "OK" and not health["sizing"]["errors"]
+
+
+def _refresh_test_cache(tmp_path, monkeypatch):
+    import ops.us_hybrid_backtest as us
+    from ops.ops_live_safety import nyse_calendar
+    dates = nyse_calendar("2026-10-01", "2026-10-08").sessions_in_range("2026-10-01", "2026-10-08")
+    old = pd.DataFrame({"AAPL": [100.] * len(dates)}, index=dates)
+    meta = pd.DataFrame({"Code": ["AAPL"]})
+    meta.to_parquet(tmp_path / "us_universe_meta.parquet")
+    for name in ("us_prices_panel.parquet", "us_open_panel.parquet", "us_volume_panel.parquet"):
+        old.to_parquet(tmp_path / name)
+    old.rename(columns={"AAPL": "Close"}).to_parquet(tmp_path / "spy.parquet")
+    monkeypatch.setattr(us, "DATA", tmp_path)
+    for attribute in ("CACHE_META", "CACHE_PRICES", "CACHE_OPEN", "CACHE_INDEX", "CACHE_FUND", "CACHE_VAL"):
+        monkeypatch.setattr(us, attribute, tmp_path / getattr(us, attribute).name)
+    monkeypatch.setattr(us, "build_universe", lambda *a, **k: meta)
+    monkeypatch.setattr(us, "_download_ohlcv", lambda *a, **k: (old + 10, old + 10, old * 1e6))
+    monkeypatch.setattr(us.yf, "download", lambda *a, **k: old.rename(columns={"AAPL": "Close"}))
+    return us, old
+
+
+def test_cmd_refresh_spy_failure_preserves_entire_cache(tmp_path, monkeypatch, capsys):
+    from argparse import Namespace
+    from ops.ops import cmd_refresh
+    us, _ = _refresh_test_cache(tmp_path, monkeypatch)
+    before = {p.name: p.read_bytes() for p in tmp_path.glob("*.parquet")}
+    def fail(*args, **kwargs):
+        raise RuntimeError("SPY failed after price download")
+    monkeypatch.setattr(us.yf, "download", fail)
+    assert cmd_refresh(Namespace(smart=False, no_xlsx=True)) == 2
+    assert "existing cache preserved" in capsys.readouterr().out
+    assert not (tmp_path / "current_snapshot.json").exists()
+    assert before == {p.name: p.read_bytes() for p in tmp_path.glob("*.parquet")}
+    staged = next((tmp_path / "snapshots").iterdir())
+    assert pd.read_parquet(staged / "us_prices_panel.parquet").iloc[-1, 0] == 110.
+
+
+def test_refresh_publishes_a_version_and_preserves_old_version_on_failure(tmp_path, monkeypatch):
+    us, old = _refresh_test_cache(tmp_path, monkeypatch)
+    us.refresh_market_snapshot(now="2026-10-08 21:00:00Z")
+    pinned = us.market_data_dir(tmp_path)
+    pointer = (tmp_path / "current_snapshot.json").read_bytes()
+    assert pinned != tmp_path and pd.read_parquet(pinned / "us_prices_panel.parquet").iloc[-1, 0] == 110.
+    assert pd.read_parquet(tmp_path / "us_prices_panel.parquet").iloc[-1, 0] == 100.
+    from ops.ops import resolve_signal_month
+    from ops.ops_daily import load_close_panel
+    assert resolve_signal_month()[1] == pd.Timestamp("2026-10-08")
+    assert load_close_panel().iloc[-1, 0] == 110.
+    import ops.ops_monthly_run as monthly
+    monkeypatch.setattr(monthly, "DATA", tmp_path)
+    loaded = monthly.load_market(include_open=True)
+    assert loaded[0].iloc[-1, 0] == 110. and loaded[-1].iloc[-1, 0] == 110.
+    monkeypatch.setattr(us, "_download_ohlcv", lambda *a, **k: (old + 20, old + 20, old * 1e6))
+    def fail(*args, **kwargs):
+        raise RuntimeError("SPY failed")
+    monkeypatch.setattr(us.yf, "download", fail)
+    with pytest.raises(RuntimeError, match="SPY failed"):
+        us.refresh_market_snapshot(now="2026-10-08 21:00:00Z")
+    assert (tmp_path / "current_snapshot.json").read_bytes() == pointer
+    assert us.market_data_dir(tmp_path) == pinned
+    assert pd.read_parquet(pinned / "us_prices_panel.parquet").iloc[-1, 0] == 110.
+    with pytest.raises(RuntimeError, match="immutable"):
+        us.load_prices(["AAPL"], force=True)
+    with pytest.raises(RuntimeError, match="immutable"):
+        us.load_prices(["AAPL"], force=True, data_dir=pinned)
+
+
+@pytest.mark.parametrize("failure", ["missing_session", "symbol_axes", "publish"])
+def test_snapshot_validation_and_publish_failure_preserve_pointer(tmp_path, monkeypatch, failure):
+    us, old = _refresh_test_cache(tmp_path, monkeypatch)
+    us.refresh_market_snapshot(now="2026-10-08 21:00:00Z")
+    before = (tmp_path / "current_snapshot.json").read_bytes()
+    if failure == "missing_session":
+        truncated = old.drop(old.index[2])
+        monkeypatch.setattr(us, "_download_ohlcv", lambda *a, **k: (truncated, truncated, truncated))
+    elif failure == "symbol_axes":
+        monkeypatch.setattr(us, "_download_ohlcv", lambda *a, **k: (old, old.rename(columns={"AAPL": "MSFT"}), old))
+    else:
+        import ops.ops_live_safety as safety
+        original_replace = safety.os.replace
+        def fail_replace(source, target):
+            if Path(target).name == "current_snapshot.json":
+                raise PermissionError("pointer publish failed")
+            return original_replace(source, target)
+        monkeypatch.setattr(safety.os, "replace", fail_replace)
+    with pytest.raises((ValueError, PermissionError)):
+        us.refresh_market_snapshot(now="2026-10-08 21:00:00Z")
+    assert (tmp_path / "current_snapshot.json").read_bytes() == before
+
+
+def test_weekly_truncated_tuesday_and_missing_friday_are_refused():
+    from ops.ops_daily import _classify_run_day, _weekly_anchor_map
+    spy = pd.Series([100., 101., 102.], index=pd.to_datetime(["2026-10-02", "2026-10-05", "2026-10-06"]))
+    reason, row_date = _classify_run_day(pd.Timestamp("2026-10-06"), spy, now="2026-10-06 22:00:00Z")
+    assert reason == "not_weekly_anchor_day:2026-10-06:2026-10-09" and row_date is None
+    anchors = _weekly_anchor_map(spy.index)
+    assert pd.Timestamp("2026-10-09") in anchors.values()
+    reason, row_date = _classify_run_day(pd.Timestamp("2026-10-10"), spy, now="2026-10-10 12:00:00Z")
+    assert reason.startswith("not_a_us_trading_day_or_missing_spy") and row_date is None
+
+
+@pytest.mark.parametrize("day,before,after", [
+    ("2026-10-09", "2026-10-09 19:59:59Z", "2026-10-09 20:00:00Z"),
+    ("2026-11-27", "2026-11-27 17:59:59Z", "2026-11-27 18:00:00Z"),
+    ("2026-04-02", "2026-04-02 19:59:59Z", "2026-04-02 20:00:00Z"),
+])
+def test_weekly_requires_actual_session_close_including_early_close(day, before, after):
+    from ops.ops_daily import _classify_run_day
+    t = pd.Timestamp(day)
+    spy = pd.Series([100.], index=[t])
+    reason, row = _classify_run_day(t, spy, now=before)
+    assert reason.startswith("weekly_session_not_closed") and row is None
+    assert _classify_run_day(t, spy, now=after) == (None, day)
+
+
+def test_weekly_fake_holiday_bar_does_not_make_a_trading_day():
+    from ops.ops_daily import _classify_run_day
+    spy = pd.Series([100., 101.], index=pd.to_datetime(["2026-04-02", "2026-04-03"]))
+    reason, row = _classify_run_day(pd.Timestamp("2026-04-03"), spy, now="2026-04-03 22:00:00Z")
+    assert reason.startswith("not_a_us_trading_day_or_missing_spy") and row is None
+
+
+def test_default_package_resolution_ignores_incomplete_current_month(tmp_path, monkeypatch):
+    import ops.ops as cli
+    import ops.ops_live_safety as safety
+    import ops.us_hybrid_backtest as us
+    run = make_package(tmp_path / "runs", "2026-09-30")
+    make_package(tmp_path / "runs", "2026-10-07")
+    prices = tmp_path / "prices.parquet"
+    pd.DataFrame({"AAPL": [100., 101.]}, index=pd.to_datetime(["2026-09-30", "2026-10-07"])).to_parquet(prices)
+    monkeypatch.setattr(cli, "OPS_RUNS", run.parent)
+    monkeypatch.setattr(us, "CACHE_PRICES", prices)
+    monkeypatch.setattr(safety, "ny_today", lambda: date(2026, 10, 8))
+    assert cli.resolve_ops_month() == (run, pd.Timestamp("2026-09-30"))
+    assert cli.resolve_signal_month()[1] == pd.Timestamp("2026-10-07")
+    prices.unlink()
+    assert cli.resolve_ops_month()[0] == run
+
+
+def test_no_completed_package_is_a_clean_lookup_failure(tmp_path, monkeypatch):
+    import ops.ops as cli
+    monkeypatch.setattr(cli, "OPS_RUNS", tmp_path)
+    with pytest.raises(FileNotFoundError, match="No completed monthly package"):
+        cli.resolve_ops_month()
+    assert cli.sync_ops_excel(positions="none") is None
+    assert not list(tmp_path.iterdir())
+
+
+def test_position_context_does_not_retain_previous_broker_book(tmp_path, monkeypatch):
+    import ops.ops_monthly_run as monthly
+    import ops.toss_portfolio as portfolio
+    book = {"total_usd": 10000., "cash_usd": 10000., "us_holdings": []}
+    monkeypatch.delenv("OPS_CAPITAL_USD", raising=False)
+    monkeypatch.setattr(portfolio, "fetch_portfolio", lambda: book)
+    monkeypatch.setattr(portfolio, "us_weights", lambda b: {"AAPL": .1})
+    assert monthly.load_position_context("toss") == ({"AAPL": .1}, book)
+    assert monthly.load_position_context("none") == ({}, None)
+    csv = tmp_path / "holdings.csv"
+    pd.DataFrame({"code": ["MSFT"], "weight": [1.]}).to_csv(csv, index=False)
+    weights, current_book = monthly.load_position_context(str(csv))
+    assert weights == {"MSFT": 1.} and current_book is None
+    assert monthly.resolve_capital_usd(current_book) == (None, "none")
+    assert monthly.load_positions("none") == {}
+    assert not hasattr(monthly.load_positions, "last_toss_book")
+
+
+def test_execute_missing_order_never_connects_or_sends(tmp_path, monkeypatch):
+    import ops.ops_execute as execute
+    import ops.ops_monthly_run as monthly
+    import ops.toss_orders as broker
+    run = make_package(tmp_path)
+    orders = pd.read_csv(run / "orders_preview.csv")
+    orders.loc[0, "qty"] = float("nan")
+    orders.to_csv(run / "orders_preview.csv", index=False)
+    monkeypatch.setenv("TOSS_ACCOUNT_SEQ", "1")
+    monkeypatch.setattr(execute, "LIVE_ORDERS_ENABLED", True)
+    monkeypatch.setattr(execute, "validate_execute_package", lambda *a, **k: {"ok": True})
+    monkeypatch.setattr(monthly, "rebuild_rebalance_ticket", lambda *a, **k: {"book": {"cash_usd": 1000.}})
+    connect, place = MagicMock(), MagicMock()
+    monkeypatch.setattr(broker.OrderClient, "connect", connect)
+    monkeypatch.setattr(execute, "place_and_await", place)
+    code, summary = execute.run_execute(run, positions="toss", no_xlsx=True, risk_mode="NORMAL")
+    assert code == 3 and summary["error"] == "gate_A_fail" and summary["http_order_posts"] == 0
+    connect.assert_not_called()
+    place.assert_not_called()

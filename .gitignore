@@ -11,6 +11,8 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .venv/
+.audit-venv/
+.audit-clean-venv/
 venv/
 
 # Excel locks / OS junk
@@ -20,6 +22,8 @@ desktop.ini
 
 # Runtime data (downloaded by `python ops.py refresh`)
 data/us/*.parquet
+data/us/snapshots/
+data/us/current_snapshot.json
 data/holdings_toss_latest.*
 
 # Run artifacts (created by ops.py; not committed)

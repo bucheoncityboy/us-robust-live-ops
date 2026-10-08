@@ -323,6 +323,7 @@ def run_window(
 
 
 def main() -> None:
+    raise RuntimeError("Legacy accounting disabled; use research/walk_forward_validation.py")
     OUT.mkdir(parents=True, exist_ok=True)
     CHARTS.mkdir(parents=True, exist_ok=True)
     print("== 1) production data load (cache only) ==")
