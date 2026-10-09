@@ -35,7 +35,7 @@ npx --yes tsx src/harness.ts
 ## 한계
 
 - Retrospective validation; frozen strategy was designed with historical data knowledge.
-- Current-constituent cache retains survivorship/preselection bias; only 149 cached names, not historical full S&P500 membership.
+- Universe: 149 names in the available current-constituent cache; historical S&P 500 membership is not reconstructed.
 - Fixed-policy temporal validation; IS is diagnostic and is not a model-refitting walk-forward.
 - Monthly t-test assumes independent observations; block bootstrap only checks short dependence and sampling sensitivity.
 - SPY close-to-close returns are a passive gross benchmark; strategy pays entry/rebalance/exit costs.
